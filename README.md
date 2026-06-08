@@ -459,15 +459,3 @@ outputs/               生成的报告和 dossier，默认不提交
 python3 -m unittest -b tests.test_app tests.test_llm
 ```
 
-## Git 提交注意
-
-仓库默认忽略本地运行文件：
-
-- `.env`
-- `.venv/`
-- `data/*`
-- `outputs/*`
-- `work/`
-- 缓存和临时目录
-
-不要提交 API key 和生成的 dossier。
