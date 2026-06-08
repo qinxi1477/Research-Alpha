@@ -1,0 +1,13 @@
+signals:
+  best_paper:
+    weight: 5.0
+  outstanding_paper:
+    weight: 4.0
+  test_of_time:
+    weight: 4.0
+  high_citation:
+    weight: 3.0
+  oral:
+    weight: 2.0
+  spotlight:
+    weight: 1.5

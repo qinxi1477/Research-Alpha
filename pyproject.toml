@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "research-alpha"
+version = "0.1.0"
+description = "A local CLI for building and evaluating AI/ML research ideas."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Codex" }
+]
+dependencies = []
+
+[project.scripts]
+ra = "research_alpha.cli:main"
+research-alpha = "research_alpha.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["research_alpha"]

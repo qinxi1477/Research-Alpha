@@ -1,0 +1,47 @@
+venues:
+  conferences:
+    - id: aaai
+      display_name: AAAI
+      category: ccf-a
+      track: ai
+    - id: neurips
+      display_name: NeurIPS
+      category: ccf-a
+      track: ml
+    - id: acl
+      display_name: ACL
+      category: ccf-a
+      track: nlp
+    - id: cvpr
+      display_name: CVPR
+      category: ccf-a
+      track: vision
+    - id: iccv
+      display_name: ICCV
+      category: ccf-a
+      track: vision
+    - id: icml
+      display_name: ICML
+      category: ccf-a
+      track: ml
+    - id: ijcai
+      display_name: IJCAI
+      category: ccf-a
+      track: ai
+    - id: iclr
+      display_name: ICLR
+      category: extended-top-tier
+      track: ml
+  journals:
+    - id: ai
+      display_name: Artificial Intelligence
+      category: ccf-a
+    - id: tpami
+      display_name: TPAMI
+      category: ccf-a
+    - id: ijcv
+      display_name: IJCV
+      category: ccf-a
+    - id: jmlr
+      display_name: JMLR
+      category: ccf-a
