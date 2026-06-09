@@ -27,6 +27,8 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+The bundled `./ra` launcher uses `.venv/bin/python` when present, or `uv run python` when available, so local PDF parsing dependencies are loaded for CLI runs.
+
 Copy the environment template:
 
 ```bash
@@ -96,6 +98,13 @@ For a small local demo with bundled sample papers:
 ./ra genome-build --limit 5 --extractive
 ./ra pattern-build --limit 5 --extractive
 ./ra evidence
+```
+
+For a local Gold-paper seed set with full-text links:
+
+```bash
+./ra gold-seed --file seeds/gold_papers.jsonl --fulltext --extractive-genomes
+./ra evidence --papers 20
 ```
 
 For a stricter LLM-backed evidence base:
@@ -184,6 +193,7 @@ In the system design, user-library papers are kept separate from:
 ./ra trends                       # build frontier trend report
 ./ra limitations                  # extract recent limitation signals
 ./ra genome-build                 # build Idea Genome Cards
+./ra genome-build --refresh-stale --dry-run
 ./ra pattern-build                # build Pattern Cards
 ./ra evidence                     # readiness audit
 ./ra audit                        # provenance and grounding audit
@@ -195,6 +205,8 @@ In the system design, user-library papers are kept separate from:
 ./ra step --latest "..."          # refine session
 ./ra reviewer --latest            # reviewer gate
 ./ra review-loop --latest         # automatic reviewer/refinement loop
+scripts/verify_local.sh           # offline evidence-pipeline smoke test
+scripts/verify_live.sh ds sk-...  # live provider smoke test
 ```
 
 Full command list:
@@ -210,7 +222,7 @@ research_alpha/        core package: CLI pipeline, GUI, DB, evidence logic, LLM 
 configs/               venue and award-signal configuration
 seeds/                 tiny demo paper corpus
 tests/                 unit and integration tests
-scripts/               live verification helper
+scripts/               local and live verification helpers
 docs/                  implementation notes
 data/                  local SQLite runtime state, ignored except .gitkeep
 outputs/               generated reports/dossiers, ignored except .gitkeep
@@ -219,7 +231,8 @@ outputs/               generated reports/dossiers, ignored except .gitkeep
 ## Test
 
 ```bash
-python3 -m unittest -b tests.test_app tests.test_llm
+python3 -m unittest -b tests.test_app tests.test_llm tests.test_full_text
+scripts/verify_local.sh
 ```
 
 ## Git Hygiene
@@ -263,6 +276,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
+
+仓库自带的 `./ra` 启动器会优先使用 `.venv/bin/python`，或在可用时使用 `uv run python`，以便 CLI 运行时加载本地 PDF 解析依赖。
 
 复制环境变量模板：
 
@@ -333,6 +348,13 @@ GUI 支持：
 ./ra genome-build --limit 5 --extractive
 ./ra pattern-build --limit 5 --extractive
 ./ra evidence
+```
+
+使用带全文链接的本地 Gold paper 种子：
+
+```bash
+./ra gold-seed --file seeds/gold_papers.jsonl --fulltext --extractive-genomes
+./ra evidence --papers 20
 ```
 
 构建更严格的 LLM 证据库：
@@ -421,6 +443,7 @@ GUI 支持：
 ./ra trends                       # 生成趋势报告
 ./ra limitations                  # 抽取近期局限性信号
 ./ra genome-build                 # 生成 Idea Genome Cards
+./ra genome-build --refresh-stale --dry-run
 ./ra pattern-build                # 聚合 Pattern Cards
 ./ra evidence                     # evidence readiness 检查
 ./ra audit                        # provenance 和 grounding 审计
@@ -432,6 +455,8 @@ GUI 支持：
 ./ra step --latest "..."          # 打磨 session
 ./ra reviewer --latest            # 审稿 gate
 ./ra review-loop --latest         # 自动审稿和改写循环
+scripts/verify_local.sh           # 离线 evidence pipeline smoke test
+scripts/verify_live.sh ds sk-...  # live 模型连通和生成 smoke test
 ```
 
 完整命令列表：
@@ -447,7 +472,7 @@ research_alpha/        核心代码：CLI、GUI、DB、证据门、LLM adapter
 configs/               会议和奖项信号配置
 seeds/                 极小 demo 论文数据
 tests/                 单元测试和接口测试
-scripts/               live verification helper
+scripts/               本地和 live 验证脚本
 docs/                  实现笔记
 data/                  本地 SQLite 状态，默认不提交
 outputs/               生成的报告和 dossier，默认不提交
@@ -456,6 +481,7 @@ outputs/               生成的报告和 dossier，默认不提交
 ## 测试
 
 ```bash
-python3 -m unittest -b tests.test_app tests.test_llm
+python3 -m unittest -b tests.test_app tests.test_llm tests.test_full_text
+scripts/verify_local.sh
 ```
 

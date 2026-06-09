@@ -168,11 +168,30 @@ def build_differentiation_note(label: str, top_match_title: str, overlap_terms: 
     return "No strong local prior-art overlap found in the current metadata and abstract corpus."
 
 
+def infer_missing_parts(label: str, overlap_terms: Sequence[str]) -> List[str]:
+    if label in {"duplicate", "near_miss"}:
+        return [
+            "novelty boundary must be stated beyond shared terms: " + ", ".join(overlap_terms[:4]),
+            "different mechanism, evidence target, or evaluation protocol is required",
+        ]
+    if label == "complementary":
+        return ["position as a boundary case or extension rather than a renamed version"]
+    return ["no close local coverage detected in metadata/abstract evidence"]
+
+
+def renamed_only_risk(label: str, title_score: float, body_score: float, overlap_terms: Sequence[str]) -> str:
+    if label == "duplicate" or (title_score >= 0.55 and body_score >= 0.4):
+        return "high"
+    if label == "near_miss" or (len(overlap_terms) >= 5 and body_score >= 0.25):
+        return "medium"
+    return "low"
+
+
 def analyze_prior_art(
     *,
     idea_payload: Dict[str, Any],
     papers: Sequence[Dict[str, Any]],
-    top_k: int = 3,
+    top_k: int = 10,
 ) -> Dict[str, Any]:
     idea_title_tokens = tokenize(idea_payload.get("idea_title", ""))
     idea_body_tokens = tokenize(build_idea_text(idea_payload))
@@ -189,6 +208,7 @@ def analyze_prior_art(
         overlap_terms = top_overlap_terms(idea_body_tokens, paper_body_tokens)
         if combined_score <= 0 and not overlap_terms:
             continue
+        label = classify_overlap(title_score, body_score, combined_score)
         matches.append(
             {
                 "paper_id": int(paper.get("id", 0)),
@@ -198,12 +218,16 @@ def analyze_prior_art(
                 "combined_score": round(combined_score, 2),
                 "title_score": round(title_score, 2),
                 "body_score": round(body_score, 2),
+                "overlap_label": label,
                 "overlap_terms": overlap_terms,
                 "reason": (
                     "High title/body overlap."
                     if combined_score >= 0.43
                     else "Some overlapping framing or evaluation language."
                 ),
+                "covered_parts": overlap_terms[:5],
+                "missing_parts": infer_missing_parts(label, overlap_terms),
+                "renamed_only_risk": renamed_only_risk(label, title_score, body_score, overlap_terms),
             }
         )
 
@@ -222,6 +246,8 @@ def analyze_prior_art(
             "overlap_score": 0.0,
             "summary": "No strong local prior-art overlap found in the current metadata and abstract corpus.",
             "differentiation_note": "No strong local prior-art overlap found in the current metadata and abstract corpus.",
+            "novelty_boundary": "No local boundary pressure detected; still verify against recent full-text prior art before claiming novelty.",
+            "renamed_only_risk": "low",
             "top_matches": [],
             "evidence_scope": "local_metadata_and_abstracts_only",
         }
@@ -233,6 +259,15 @@ def analyze_prior_art(
         float(best_match["combined_score"]),
     )
     note = build_differentiation_note(label, str(best_match["title"]), list(best_match["overlap_terms"]))
+    novelty_boundary = (
+        "Reject unless the idea changes the core hypothesis, mechanism, or evaluation target relative to the closest work."
+        if label == "duplicate"
+        else "State a concrete boundary against the closest work before acceptance."
+        if label == "near_miss"
+        else "Keep the idea framed as a distinct boundary or extension of the related work."
+        if label == "complementary"
+        else "No strong local boundary found in metadata/abstract evidence."
+    )
     if label == "duplicate":
         summary = f"Closest local overlap is `{best_match['title']}` and the idea currently looks too close."
     elif label == "near_miss":
@@ -247,6 +282,13 @@ def analyze_prior_art(
         "overlap_score": round(float(best_match["combined_score"]), 2),
         "summary": summary,
         "differentiation_note": note,
+        "novelty_boundary": novelty_boundary,
+        "renamed_only_risk": renamed_only_risk(
+            label,
+            float(best_match["title_score"]),
+            float(best_match["body_score"]),
+            list(best_match["overlap_terms"]),
+        ),
         "top_matches": top_matches,
         "evidence_scope": "local_metadata_and_abstracts_only",
     }

@@ -1,7 +1,18 @@
-#!/usr/bin/env python3
+#!/usr/bin/env bash
 
-from research_alpha.cli import main
+set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if [[ -z "${RA_BOOTSTRAPPED:-}" ]]; then
+  export RA_BOOTSTRAPPED=1
+  if [[ -x "$script_dir/.venv/bin/python" ]]; then
+    exec "$script_dir/.venv/bin/python" "$script_dir/ra.py" "$@"
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    cd "$script_dir"
+    exec uv run python "$script_dir/ra.py" "$@"
+  fi
+fi
+
+exec python3 "$script_dir/ra.py" "$@"

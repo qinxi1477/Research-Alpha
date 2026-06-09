@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS papers (
     score_notes TEXT NOT NULL DEFAULT '',
     publication_date TEXT NOT NULL DEFAULT '',
     limitations_json TEXT NOT NULL DEFAULT '{}',
+    full_text_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -108,6 +109,7 @@ PAPER_COLUMNS = {
     "score_notes": "TEXT NOT NULL DEFAULT ''",
     "publication_date": "TEXT NOT NULL DEFAULT ''",
     "limitations_json": "TEXT NOT NULL DEFAULT '{}'",
+    "full_text_json": "TEXT NOT NULL DEFAULT '{}'",
 }
 
 IDEA_SESSION_COLUMNS = {
@@ -186,7 +188,7 @@ def add_paper(
             """
             SELECT
                 id, abstract, source_kind, external_ref, award, citation_count,
-                influential_citation_count, publication_date, limitations_json
+                influential_citation_count, publication_date, limitations_json, full_text_json
             FROM papers
             WHERE lower(title)=lower(?) AND lower(venue)=lower(?) AND year=?
             """,
@@ -320,7 +322,7 @@ def list_user_library_papers(db_path: Path, limit: int = 20) -> List[sqlite3.Row
                 SELECT
                     id, title, abstract, venue, year, source_kind, external_ref,
                     award, citation_count, influential_citation_count, paper_weight,
-                    score_notes, publication_date, limitations_json, created_at
+                    score_notes, publication_date, limitations_json, full_text_json, created_at
                 FROM papers
                 WHERE COALESCE(source_kind, '') = 'user_library'
                 ORDER BY created_at DESC, id DESC
@@ -465,7 +467,7 @@ def get_paper_by_id(db_path: Path, paper_id: int) -> Optional[sqlite3.Row]:
             SELECT
                 id, title, abstract, venue, year, source_kind, external_ref,
                 award, citation_count, influential_citation_count, paper_weight, score_notes,
-                publication_date, limitations_json
+                publication_date, limitations_json, full_text_json
             FROM papers
             WHERE id = ?
             """,
@@ -544,9 +546,9 @@ def list_top_papers(db_path: Path, limit: int = 10) -> List[sqlite3.Row]:
             conn.execute(
                 """
                 SELECT
-                    id, title, abstract, venue, year, source_kind, external_ref, award, citation_count,
-                    influential_citation_count, paper_weight, score_notes,
-                    publication_date, limitations_json
+                id, title, abstract, venue, year, source_kind, external_ref, award, citation_count,
+                influential_citation_count, paper_weight, score_notes,
+                publication_date, limitations_json, full_text_json
                 FROM papers
                 WHERE COALESCE(paper_weight, 0) > 0
                 ORDER BY paper_weight DESC, citation_count DESC, id ASC
@@ -658,7 +660,8 @@ def list_papers_for_genome_build(
                     papers.paper_weight,
                     papers.score_notes
                     ,papers.publication_date,
-                    papers.limitations_json
+                    papers.limitations_json,
+                    papers.full_text_json
                 FROM papers
                 LEFT JOIN idea_cards ON idea_cards.paper_id = papers.id
                 {where_clause}
@@ -684,6 +687,8 @@ def list_genome_card_payloads(db_path: Path, limit: int = 10) -> List[sqlite3.Ro
                     papers.venue,
                     papers.year,
                     papers.source_kind,
+                    papers.abstract,
+                    papers.full_text_json,
                     papers.award,
                     papers.paper_weight
                 FROM idea_cards
@@ -710,6 +715,8 @@ def list_gold_genome_card_payloads(db_path: Path, limit: int = 10) -> List[sqlit
                     papers.venue,
                     papers.year,
                     papers.source_kind,
+                    papers.abstract,
+                    papers.full_text_json,
                     papers.award,
                     papers.paper_weight
                 FROM idea_cards
@@ -961,6 +968,54 @@ def update_paper_limitations(db_path: Path, paper_id: int, limitations_json: str
         conn.execute(
             "UPDATE papers SET limitations_json = ? WHERE id = ?",
             (limitations_json.strip() or "{}", int(paper_id)),
+        )
+
+
+def update_paper_full_text(db_path: Path, paper_id: int, full_text_json: str) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE papers SET full_text_json = ? WHERE id = ?",
+            (full_text_json.strip() or "{}", int(paper_id)),
+        )
+
+
+def update_user_library_paper_metadata(
+    db_path: Path,
+    paper_id: int,
+    *,
+    title: str = "",
+    venue: str = "",
+    year: int = 0,
+    abstract: str = "",
+) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE papers
+            SET
+                title = CASE WHEN ? != '' THEN ? ELSE title END,
+                abstract = CASE WHEN ? != '' THEN ? ELSE abstract END,
+                venue = CASE WHEN ? != '' THEN ? ELSE venue END,
+                year = CASE WHEN ? > 0 THEN ? ELSE year END,
+                award = '',
+                citation_count = 0,
+                influential_citation_count = 0,
+                paper_weight = 0,
+                score_notes = ?
+            WHERE id = ? AND COALESCE(source_kind, '') = 'user_library'
+            """,
+            (
+                title.strip(),
+                title.strip(),
+                abstract.strip(),
+                abstract.strip(),
+                venue.strip(),
+                venue.strip(),
+                int(year or 0),
+                int(year or 0),
+                dumps({"user_library_domain_knowledge_only": 0.0}, ensure_ascii=True, sort_keys=True),
+                int(paper_id),
+            ),
         )
 
 

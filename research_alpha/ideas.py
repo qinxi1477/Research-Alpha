@@ -27,6 +27,15 @@ REQUIRED_STORYLINE_TRACE_KEYS = [
     "evidence_design",
     "failure_boundary",
 ]
+EVALUATION_PROTOCOL_DIMENSIONS = [
+    "practical_utility",
+    "generalizability",
+    "hypothesis_discovery_rate",
+    "novelty_boundary",
+    "impact_potential",
+    "defensibility",
+    "evidence_depth",
+]
 
 
 def build_idea_prompt(
@@ -59,6 +68,8 @@ def build_idea_prompt(
         "Scoring-standard discipline:\n"
         "- Innovation, logic, feasibility, value, and defensibility standards must come from supplied Genome/Pattern/Paper evidence.\n"
         "- Do not use your generic sense of what is novel or feasible as a scoring standard.\n"
+        "- Prefer evidence sources marked full_text_sections or section-level Genome evidence when several allowed sources support the same logic move.\n"
+        "- If you must use abstract-only evidence, keep the claim bounded and mention the evidence-depth risk in key_risk or evaluation protocol.\n"
         "- For each scoring dimension, evidence_basis.used_for must point to matched sources that justify that dimension.\n\n"
         "- Each idea's evidence_basis must cover all five dimensions exactly: innovation, logic, feasibility, value, defensibility.\n"
         "- Prefer one evidence_basis item per dimension, or use `used_for` with `innovation|logic|feasibility|value|defensibility` only when one source truly supports all five.\n\n"
@@ -90,6 +101,10 @@ def build_idea_prompt(
         "Recent-limitations discipline:\n"
         "- Treat recent high-quality/frontier paper limitations as strong negative evidence: a good idea should either attack one explicit limitation or explain why it avoids that boundary.\n"
         "- If recent_limitations says full text review is needed, say so as a risk instead of pretending the limitation is known.\n\n"
+        "Idea-evaluation discipline:\n"
+        "- The project may generate ideas without executing experiments. Therefore each idea must include an idea_evaluation_protocol that evaluates the idea itself.\n"
+        "- The protocol should cover practical utility, generalizability, hypothesis discovery rate, novelty boundary, impact potential, defensibility, and evidence depth.\n"
+        "- Do not replace the protocol with a full experimental plan; first_experiments may suggest later validation, but idea_evaluation_protocol judges whether the idea is worth pursuing.\n\n"
         "Return JSON only with this exact schema:\n"
         "{\n"
         '  "ideas": [\n'
@@ -105,6 +120,19 @@ def build_idea_prompt(
         '      "key_risk": "...",\n'
         '      "first_experiments": ["..."],\n'
         '      "evaluation_outline": "...",\n'
+        '      "idea_evaluation_protocol": {\n'
+        '        "purpose": "Evaluate idea quality, not execute the full research project.",\n'
+        '        "dimensions": [\n'
+        '          {"name": "practical_utility", "question": "...", "evidence_needed": "...", "pass_condition": "..."},\n'
+        '          {"name": "generalizability", "question": "...", "evidence_needed": "...", "pass_condition": "..."},\n'
+        '          {"name": "hypothesis_discovery_rate", "question": "...", "evidence_needed": "...", "pass_condition": "..."},\n'
+        '          {"name": "novelty_boundary", "question": "...", "evidence_needed": "...", "pass_condition": "..."},\n'
+        '          {"name": "impact_potential", "question": "...", "evidence_needed": "...", "pass_condition": "..."},\n'
+        '          {"name": "defensibility", "question": "...", "evidence_needed": "...", "pass_condition": "..."},\n'
+        '          {"name": "evidence_depth", "question": "...", "evidence_needed": "...", "pass_condition": "..."}\n'
+        '        ],\n'
+        '        "reject_if": ["..."]\n'
+        '      },\n'
         '      "paper_angle": "...",\n'
         '      "storyline_trace": {\n'
         '        "old_belief": {"source_id": "...", "paper_story_standard": "...", "transfer_to_current_hotspot": "..."},\n'
@@ -265,6 +293,7 @@ def parse_idea_response(text: str) -> List[Dict[str, Any]]:
         if not str(item.get("generation_guardrail", "")).strip():
             raise ValueError("Idea entry must include a non-empty `generation_guardrail`")
         _validate_idea_content_quality(item)
+        item["idea_evaluation_protocol"] = normalize_idea_evaluation_protocol(item)
         storyline_trace = item.get("storyline_trace")
         if not isinstance(storyline_trace, dict):
             raise ValueError("Idea entry must include a `storyline_trace` object")
@@ -296,6 +325,89 @@ def parse_idea_response(text: str) -> List[Dict[str, Any]]:
             )
         normalized.append(item)
     return normalized
+
+
+def normalize_idea_evaluation_protocol(item: Dict[str, Any]) -> Dict[str, Any]:
+    protocol = item.get("idea_evaluation_protocol")
+    if not isinstance(protocol, dict):
+        protocol = {}
+    raw_dimensions = protocol.get("dimensions", [])
+    if not isinstance(raw_dimensions, list):
+        raw_dimensions = []
+    by_name: Dict[str, Dict[str, str]] = {}
+    for entry in raw_dimensions:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        if name not in EVALUATION_PROTOCOL_DIMENSIONS:
+            continue
+        by_name[name] = {
+            "name": name,
+            "question": str(entry.get("question", "")).strip(),
+            "evidence_needed": str(entry.get("evidence_needed", "")).strip(),
+            "pass_condition": str(entry.get("pass_condition", "")).strip(),
+        }
+    dimensions = []
+    for name in EVALUATION_PROTOCOL_DIMENSIONS:
+        existing = by_name.get(name, {})
+        dimensions.append(
+            {
+                "name": name,
+                "question": existing.get("question") or default_protocol_question(name),
+                "evidence_needed": existing.get("evidence_needed") or default_protocol_evidence(name, item),
+                "pass_condition": existing.get("pass_condition") or default_protocol_pass_condition(name),
+            }
+        )
+    reject_if = protocol.get("reject_if", [])
+    if not isinstance(reject_if, list):
+        reject_if = []
+    cleaned_reject_if = [str(value).strip() for value in reject_if if str(value).strip()]
+    if not cleaned_reject_if:
+        cleaned_reject_if = [
+            "Reject if the closest prior art already covers the core hypothesis or only the nouns changed.",
+            "Reject if the idea cannot cite supplied Gold/Genome/Pattern evidence for its logic line.",
+            "Reject if evaluation only lists a case study and gives no measurable idea-quality criterion.",
+        ]
+    return {
+        "purpose": str(protocol.get("purpose", "")).strip()
+        or "Evaluate idea quality and paper-worthiness before any full experimental project.",
+        "dimensions": dimensions,
+        "reject_if": cleaned_reject_if,
+    }
+
+
+def default_protocol_question(name: str) -> str:
+    return {
+        "practical_utility": "Would this idea change what a researcher chooses, trusts, or rejects?",
+        "generalizability": "Does the logic travel beyond one narrow dataset, agent, or domain example?",
+        "hypothesis_discovery_rate": "Does the process produce more defensible hypotheses per expert-review cycle than a baseline ideation process?",
+        "novelty_boundary": "Is the idea separated from the nearest 5-10 prior papers by a real causal or evaluative boundary?",
+        "impact_potential": "Would a positive result alter a community assumption, benchmark, or evaluation practice?",
+        "defensibility": "Can the idea survive a top-conference reviewer attack on novelty, logic, feasibility, and evidence?",
+        "evidence_depth": "Is the logic grounded in full-text or section-level evidence rather than abstract-only guesses?",
+    }[name]
+
+
+def default_protocol_evidence(name: str, item: Dict[str, Any]) -> str:
+    if name == "novelty_boundary":
+        return "Prior-art gate closest_work, required_differentiation, and novelty field."
+    if name == "evidence_depth":
+        return "Genome/Pattern provenance, evidence_level, and cited source anchors."
+    if name == "hypothesis_discovery_rate":
+        return "A comparison of accepted, revised, and rejected ideas across repeated expert-review cycles."
+    return str(item.get("evaluation_outline", "")).strip() or "Use the supplied evidence_basis, storyline_trace, and reviewer-loop dossier."
+
+
+def default_protocol_pass_condition(name: str) -> str:
+    return {
+        "practical_utility": "At least one concrete decision or evaluation practice changes.",
+        "generalizability": "The idea can name two or more settings where the same logic applies without copying methods.",
+        "hypothesis_discovery_rate": "The review loop increases accepted non-duplicate ideas or reduces renamed-only failures.",
+        "novelty_boundary": "Closest prior art leaves a stated missing part that the idea directly targets.",
+        "impact_potential": "The paper angle would be meaningful even if the first implementation is small.",
+        "defensibility": "No fatal reviewer attack remains after the review loop.",
+        "evidence_depth": "Key logic steps cite section-level or explicitly bounded abstract evidence.",
+    }[name]
 
 
 def _validate_idea_content_quality(item: Dict[str, Any]) -> None:

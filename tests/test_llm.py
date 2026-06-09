@@ -17,7 +17,7 @@ from research_alpha.connectors import (
 )
 from research_alpha.config import LLMConfig, load_config
 from research_alpha.genome import parse_genome_response
-from research_alpha.llm import LLMClient, LLMError, _extract_text
+from research_alpha.llm import LLMClient, LLMError, _extract_text, estimate_tokens
 
 
 class LLMTests(unittest.TestCase):
@@ -387,7 +387,7 @@ class LLMTests(unittest.TestCase):
 
     def test_network_error_message_names_provider_and_connectivity(self) -> None:
         client = LLMClient(LLMConfig(provider="openai", api_key="test-openai-key"))
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("[Errno 8] nodename nor servname provided")):
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("[Errno 8] nodename nor servname provided")), patch("time.sleep"):
             with self.assertRaises(LLMError) as excinfo:
                 client.chat("test prompt")
         message = str(excinfo.exception)
@@ -416,3 +416,210 @@ class LLMTests(unittest.TestCase):
         self.assertIn("returned a non-JSON response", message)
         self.assertIn("https://gateway.example/chat/completions", message)
         self.assertIn("usually end in `/v1`", message)
+
+    def test_empty_success_body_is_retried_before_failing_chat(self) -> None:
+        class EmptyResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return b""
+
+        class GoodResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"choices":[{"message":{"content":"ok after retry"}}]}'
+
+        calls = []
+
+        def fake_urlopen(request, timeout=90):
+            calls.append(request)
+            return EmptyResponse() if len(calls) == 1 else GoodResponse()
+
+        client = LLMClient(LLMConfig(provider="deepseek", api_key="test-key"), retry_base_delay_seconds=0.01)
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen), patch("time.sleep") as sleep:
+            response = client.chat("test prompt")
+        self.assertEqual(response.text, "ok after retry")
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called()
+
+    def test_html_non_json_response_is_not_retried(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "text/html; charset=utf-8"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return b"<!doctype html><title>Wrong endpoint</title>"
+
+        client = LLMClient(LLMConfig(provider="openai", api_key="test-key", base_url="https://gateway.example"))
+        with patch("urllib.request.urlopen", return_value=FakeResponse()) as urlopen, patch("time.sleep") as sleep:
+            with self.assertRaises(LLMError):
+                client.chat("test prompt")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_chat_retries_retryable_http_errors_then_succeeds(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+                    }
+                ).encode("utf-8")
+
+        error = urllib.error.HTTPError(
+            "https://api.deepseek.com/v1/chat/completions",
+            429,
+            "rate limited",
+            hdrs={"Retry-After": "0.01"},
+            fp=None,
+        )
+        calls = []
+
+        def fake_urlopen(request, timeout=90):
+            calls.append((request, timeout))
+            if len(calls) == 1:
+                raise error
+            return FakeResponse()
+
+        client = LLMClient(LLMConfig(provider="deepseek", api_key="test-key"), retry_base_delay_seconds=0.01)
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen), patch("time.sleep") as sleep:
+            response = client.chat("test prompt")
+        self.assertEqual(response.text, "ok")
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called()
+        self.assertEqual(response.usage["prompt_tokens"], 12)
+        self.assertEqual(response.usage["completion_tokens"], 4)
+        self.assertIsNotNone(response.estimated_cost_usd)
+
+    def test_chat_sends_json_mode_schema_and_max_tokens(self) -> None:
+        captured = {}
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}'
+
+        def fake_urlopen(request, timeout=90):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        schema = {"name": "Idea", "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}}
+        client = LLMClient(LLMConfig(provider="openai", api_key="test-key"))
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            response = client.chat("return json", response_schema=schema, max_tokens=128, timeout_seconds=12)
+        self.assertEqual(response.text, '{"ok":true}')
+        self.assertEqual(captured["timeout"], 12)
+        self.assertEqual(captured["payload"]["max_tokens"], 128)
+        self.assertEqual(captured["payload"]["response_format"], {"type": "json_schema", "json_schema": schema})
+
+    def test_chat_sends_json_object_mode_without_schema(self) -> None:
+        captured = {}
+
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}'
+
+        def fake_urlopen(request, timeout=90):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        client = LLMClient(LLMConfig(provider="deepseek", api_key="test-key"))
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client.chat("return json", json_mode=True)
+        self.assertEqual(captured["payload"]["response_format"], {"type": "json_object"})
+
+    def test_rate_limit_waits_between_requests(self) -> None:
+        class FakeResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+        client = LLMClient(
+            LLMConfig(provider="openai", api_key="test-key"),
+            min_request_interval_seconds=1.0,
+        )
+        with patch("urllib.request.urlopen", return_value=FakeResponse()), patch("time.monotonic", side_effect=[10.0, 10.0, 10.2, 10.2]), patch("time.sleep") as sleep:
+            client.chat("one")
+            client.chat("two")
+        self.assertAlmostEqual(float(sleep.call_args.args[0]), 0.8)
+
+    def test_estimate_tokens_counts_cjk_more_tightly(self) -> None:
+        self.assertGreaterEqual(estimate_tokens("科研智能体"), 5)
+        self.assertGreaterEqual(estimate_tokens("research agents"), 3)
+
+    def test_chat_rejects_prompt_over_token_budget_before_request(self) -> None:
+        client = LLMClient(LLMConfig(provider="deepseek", api_key="test-key"), max_prompt_tokens=4)
+        with patch("urllib.request.urlopen") as urlopen:
+            with self.assertRaises(LLMError) as excinfo:
+                client.chat("research agents need a much longer prompt")
+        self.assertIn("prompt budget exceeded", str(excinfo.exception))
+        urlopen.assert_not_called()
+
+    def test_client_reads_runtime_settings_from_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "RA_LLM_TIMEOUT_SECONDS": "13",
+                "RA_LLM_MAX_RETRIES": "4",
+                "RA_LLM_RETRY_BASE_DELAY_SECONDS": "0.2",
+                "RA_LLM_MIN_REQUEST_INTERVAL_SECONDS": "0.3",
+                "RA_LLM_MAX_PROMPT_TOKENS": "1234",
+            },
+            clear=False,
+        ):
+            client = LLMClient(LLMConfig(provider="openai", api_key="test-key"))
+        self.assertEqual(client.timeout_seconds, 13)
+        self.assertEqual(client.max_retries, 4)
+        self.assertEqual(client.retry_base_delay_seconds, 0.2)
+        self.assertEqual(client.min_request_interval_seconds, 0.3)
+        self.assertEqual(client.max_prompt_tokens, 1234)

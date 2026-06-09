@@ -20,6 +20,8 @@ import re
 
 from research_alpha.config import load_config, provider_api_key_env
 from research_alpha.db import (
+    add_idea_session_turn,
+    create_idea_session,
     count_idea_cards,
     count_pattern_cards,
     count_scored_papers,
@@ -40,8 +42,12 @@ from research_alpha.db import (
     list_user_library_papers,
     upsert_user_library_paper,
     table_counts,
+    update_paper_full_text,
+    update_user_library_paper_metadata,
 )
+from research_alpha.full_text import FullTextError, extract_section_evidence, fetch_full_text_with_metadata
 from research_alpha.layout import ensure_layout
+from research_alpha.llm import LLMClient, LLMError
 
 
 TAG_ALIASES = {
@@ -146,9 +152,10 @@ VENUE_GROUPS = [
 
 
 VENUE_PRESETS = [
+    {"id": "core_official", "label": "官方稳定源", "venues": ["ICLR", "NeurIPS", "ICML", "CVPR", "ICCV"]},
     {"id": "core_all", "label": "核心全量", "venues": ["ICLR", "NeurIPS", "ICML", "CVPR", "ICCV", "TPAMI"]},
-    {"id": "ml_core", "label": "AI/ML 核心", "venues": ["ICLR", "NeurIPS", "ICML", "TPAMI"]},
-    {"id": "vision_core", "label": "视觉核心", "venues": ["CVPR", "ICCV", "TPAMI", "NeurIPS", "ICML"]},
+    {"id": "ml_core", "label": "AI/ML 核心", "venues": ["ICLR", "NeurIPS", "ICML"]},
+    {"id": "vision_core", "label": "视觉核心", "venues": ["CVPR", "ICCV", "NeurIPS", "ICML"]},
     {"id": "aux_agents", "label": "核心+Agent趋势", "venues": ["ICLR", "NeurIPS", "ICML", "ACL", "EMNLP"]},
     {"id": "aux_frontier", "label": "核心+跨域趋势", "venues": ["ICLR", "NeurIPS", "ICML", "KDD", "SIGIR", "WWW", "CHI"]},
 ]
@@ -656,6 +663,37 @@ def create_gui_http_server(
                 except GuiRequestError as exc:
                     self._send_json(gui_error_response(str(exc), status=exc.status, code=exc.code), status=exc.status)
                     return
+                scoped_session_id = session_id_from_gui_scope(ui_scope)
+                if scoped_session_id and not context_session_id:
+                    context_session_id = scoped_session_id
+                if scoped_session_id and context_session_id:
+                    resolved_session = resolve_gui_session(config.db_path, state, context_session_id, ui_scope=f"session:{context_session_id}")
+                    if resolved_session["ok"]:
+                        resolved_session_id = int(resolved_session["session_id"])
+                        session_scope = f"session:{resolved_session_id}"
+                        job, created = state.add_job_unless_running(
+                            "session step",
+                            lambda job: run_gui_stable_session_step(
+                                root_dir=config.root_dir,
+                                session_id=resolved_session_id,
+                                instruction=direction,
+                                provider=provider,
+                                on_output=lambda stream, line, job=job: state.append_job_output(job, stream, line),
+                            ),
+                            kind="step",
+                            session_id=resolved_session_id,
+                            ui_scope=session_scope,
+                            dedupe=lambda existing, resolved_session_id=resolved_session_id, session_scope=session_scope: (
+                                existing.get("kind") in GUI_CONVERSATION_JOB_KINDS
+                                and (existing.get("session_id") == resolved_session_id or existing.get("ui_scope") == session_scope)
+                            ),
+                            pass_job=True,
+                        )
+                        if not created:
+                            self._send_json({"job": job_response(job), "deduped": True})
+                            return
+                        self._send_json({"job": job_response(job), "routed_to_session_step": True})
+                        return
                 context_messages = (
                     build_chat_snapshot(config.root_dir, session_id=context_session_id).get("messages", [])
                     if context_session_id
@@ -664,30 +702,13 @@ def create_gui_http_server(
                 brief = infer_research_brief(direction, context_messages)
                 job, created = state.add_job_unless_running(
                     f"ideate: {direction}",
-                    lambda job: run_app_command_streaming(
-                        [
-                            "ideate",
-                            str(brief["brief_direction"]),
-                            "--display-direction",
-                            direction,
-                            "--frontier-query",
-                            str(brief["frontier_query"]),
-                            "--ideas",
-                            str(ideas),
-                            "--remote",
-                            remote,
-                            "--limit",
-                            str(limit),
-                            "--session",
-                            "--review-loop",
-                            "--review-rounds",
-                            "4",
-                            "--provider",
-                            provider,
-                            "--lang",
-                            lang,
-                        ],
-                        config.root_dir,
+                    lambda job: run_gui_stable_ideate_session(
+                        root_dir=config.root_dir,
+                        direction=direction,
+                        brief_direction=str(brief["brief_direction"]),
+                        provider=provider,
+                        lang=lang,
+                        review_rounds=4,
                         on_output=lambda stream, line, job=job: state.append_job_output(job, stream, line),
                     ),
                     kind="ideate",
@@ -731,9 +752,11 @@ def create_gui_http_server(
                 session_scope = f"session:{resolved_session_id}"
                 job, created = state.add_job_unless_running(
                     "session step",
-                    lambda job: run_app_command_streaming(
-                        ["step", "--session-id", str(resolved_session_id), instruction, "--provider", provider],
-                        config.root_dir,
+                    lambda job: run_gui_stable_session_step(
+                        root_dir=config.root_dir,
+                        session_id=resolved_session_id,
+                        instruction=instruction,
+                        provider=provider,
                         on_output=lambda stream, line, job=job: state.append_job_output(job, stream, line),
                     ),
                     kind="step",
@@ -911,7 +934,7 @@ def create_gui_http_server(
                 except ValueError as exc:
                     self._send_json(gui_error_response(str(exc), status=400, code="invalid_user_library_link"), status=400)
                     return
-                metadata = user_library_metadata_from_url(url, title=title, note=note)
+                metadata = user_library_fallback_metadata_from_url(url, title=title, note=note)
                 paper_id = upsert_user_library_paper(
                     config.db_path,
                     title=metadata["title"],
@@ -920,7 +943,22 @@ def create_gui_http_server(
                     abstract=metadata["abstract"],
                     external_ref=url,
                 )
-                self._send_json({"ok": True, "paper_id": paper_id, "paper": paper_row_to_gui_card(get_user_library_paper(config.db_path, paper_id))})
+                enrich_status = start_user_library_enrichment(
+                    config.db_path,
+                    paper_id,
+                    url=url,
+                    title=title,
+                    note=note,
+                    metadata=metadata,
+                )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "paper_id": paper_id,
+                        "paper": paper_row_to_gui_card(get_user_library_paper(config.db_path, paper_id)),
+                        "full_text": enrich_status,
+                    }
+                )
                 return
             if parsed.path == "/api/user-library/delete":
                 try:
@@ -945,8 +983,7 @@ def create_gui_http_server(
             if parsed.path == "/api/gold-build":
                 try:
                     venues = parse_venue_payload(payload.get("venues", ["ICLR", "NeurIPS", "ICML"]))
-                    from_year = parse_gui_int(payload.get("from_year", 2024), name="起始年份", default=2024, minimum=1990, maximum=current_gui_year())
-                    to_year = parse_gui_int(payload.get("to_year", from_year), name="结束年份", default=from_year, minimum=1990, maximum=current_gui_year())
+                    from_year, to_year = parse_gui_gold_year_range(payload)
                     per = parse_gui_int(payload.get("per_venue_year", 30), name="每个会议年份最多核验", default=30, minimum=2, maximum=40)
                     query = parse_gui_text(
                         payload.get("query", ""),
@@ -1178,6 +1215,36 @@ def current_gui_year() -> int:
     return date.today().year
 
 
+def default_gold_to_year() -> int:
+    return max(2024, current_gui_year() - 1)
+
+
+def default_gold_from_year() -> int:
+    return max(2024, default_gold_to_year() - 1)
+
+
+def parse_gui_gold_year_range(payload: dict[str, Any]) -> tuple[int, int]:
+    has_from = "from_year" in payload and payload.get("from_year", "") not in (None, "")
+    has_to = "to_year" in payload and payload.get("to_year", "") not in (None, "")
+    from_default = default_gold_from_year()
+    to_default = default_gold_to_year() if not has_from and not has_to else from_default
+    from_year = parse_gui_int(
+        payload.get("from_year", from_default),
+        name="起始年份",
+        default=from_default,
+        minimum=1990,
+        maximum=current_gui_year(),
+    )
+    to_year = parse_gui_int(
+        payload.get("to_year", to_default if not has_from else from_year),
+        name="结束年份",
+        default=to_default,
+        minimum=1990,
+        maximum=current_gui_year(),
+    )
+    return from_year, to_year
+
+
 def validate_user_library_url(value: str) -> str:
     parsed = urlparse(str(value or "").strip())
     if parsed.scheme.lower() not in {"http", "https"}:
@@ -1294,16 +1361,10 @@ def fetch_arxiv_metadata(arxiv_id: str, *, timeout: int = GUI_USER_LIBRARY_METAD
     return {key: value for key, value in result.items() if value}
 
 
-def user_library_metadata_from_url(url: str, *, title: str = "", note: str = "") -> dict[str, Any]:
+def user_library_fallback_metadata_from_url(url: str, *, title: str = "", note: str = "") -> dict[str, Any]:
     arxiv_id = arxiv_id_from_url(url)
     doi = doi_from_url(url)
     openreview_id = openreview_id_from_url(url)
-    fetched: dict[str, Any] = {}
-    if arxiv_id:
-        try:
-            fetched = fetch_arxiv_metadata(arxiv_id)
-        except Exception:
-            fetched = {}
     parsed = urlparse(url)
     fallback_title = parsed.netloc
     if arxiv_id:
@@ -1312,14 +1373,14 @@ def user_library_metadata_from_url(url: str, *, title: str = "", note: str = "")
         fallback_title = f"DOI:{doi}"
     elif openreview_id:
         fallback_title = f"OpenReview:{openreview_id}"
-    cleaned_title = title.strip() or str(fetched.get("title", "")).strip() or fallback_title
-    year = int(fetched.get("year", 0) or 0) or (year_from_arxiv_id(arxiv_id) if arxiv_id else current_gui_year())
-    fetched_abstract = str(fetched.get("abstract", "")).strip()
+    cleaned_title = title.strip() or fallback_title
+    year = year_from_arxiv_id(arxiv_id) if arxiv_id else current_gui_year()
     ref_note = ""
     venue = "User library"
-    metadata_source = str(fetched.get("metadata_source", "")).strip()
+    metadata_source = "url_fallback"
     if arxiv_id:
         venue = "arXiv"
+        metadata_source = "arxiv_url"
     elif doi:
         venue = "DOI"
         metadata_source = "doi_url"
@@ -1328,7 +1389,7 @@ def user_library_metadata_from_url(url: str, *, title: str = "", note: str = "")
         venue = "OpenReview"
         metadata_source = "openreview_url"
         ref_note = f"OpenReview id: {openreview_id}"
-    abstract_parts = [part for part in [note.strip(), ref_note, fetched_abstract] if part]
+    abstract_parts = [part for part in [note.strip(), ref_note] if part]
     return {
         "title": cleaned_title,
         "venue": venue,
@@ -1336,6 +1397,138 @@ def user_library_metadata_from_url(url: str, *, title: str = "", note: str = "")
         "abstract": "\n\n".join(abstract_parts),
         "metadata_source": metadata_source,
     }
+
+
+def user_library_metadata_from_url(url: str, *, title: str = "", note: str = "") -> dict[str, Any]:
+    metadata = user_library_fallback_metadata_from_url(url, title=title, note=note)
+    arxiv_id = arxiv_id_from_url(url)
+    if arxiv_id:
+        try:
+            fetched = fetch_arxiv_metadata(arxiv_id)
+        except Exception:
+            fetched = {}
+        if fetched:
+            fetched_abstract = str(fetched.get("abstract", "")).strip()
+            abstract_parts = [part for part in [note.strip(), fetched_abstract] if part]
+            metadata.update(
+                {
+                    "title": title.strip() or str(fetched.get("title", "")).strip() or metadata["title"],
+                    "year": int(fetched.get("year", 0) or 0) or int(metadata["year"]),
+                    "abstract": "\n\n".join(abstract_parts),
+                    "metadata_source": str(fetched.get("metadata_source", "")).strip() or metadata["metadata_source"],
+                }
+            )
+    return metadata
+
+
+def opportunistic_user_library_full_text_ingest(
+    db_path: Path,
+    paper_id: int,
+    *,
+    url: str,
+    metadata: dict[str, Any],
+    timeout: int = 12,
+    max_bytes: int = 2_500_000,
+) -> dict[str, Any]:
+    """Best-effort domain-context enrichment; never promotes user papers to evidence standards."""
+    if not str(url or "").strip():
+        return {"status": "skipped", "reason": "missing_url"}
+    try:
+        text, source_url = fetch_full_text_with_metadata(
+            url,
+            title=str(metadata.get("title", "") or ""),
+            venue=str(metadata.get("venue", "") or ""),
+            year=metadata.get("year", ""),
+            timeout=max(1, int(timeout)),
+            max_bytes=max(1, int(max_bytes)),
+        )
+        payload = extract_section_evidence(text)
+        payload["source_url"] = source_url
+        payload["parser_hint"] = (
+            "pdf_or_openreview"
+            if str(source_url).lower().endswith(".pdf") or "openreview.net/pdf" in str(source_url).lower()
+            else "html_or_text"
+        )
+        update_paper_full_text(
+            db_path,
+            paper_id,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        )
+    except FullTextError as exc:
+        return {"status": "failed", "reason": public_gui_text(str(exc))}
+    except Exception:
+        return {"status": "failed", "reason": "full_text_unavailable"}
+    return {"status": "updated", "source_url": public_external_ref(source_url)}
+
+
+def enrich_user_library_paper(
+    db_path: Path,
+    paper_id: int,
+    *,
+    url: str,
+    title: str = "",
+    note: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    resolved_metadata = metadata or user_library_fallback_metadata_from_url(url, title=title, note=note)
+    try:
+        enriched_metadata = user_library_metadata_from_url(url, title=title, note=note)
+        update_user_library_paper_metadata(
+            db_path,
+            paper_id,
+            title=enriched_metadata.get("title", ""),
+            venue=enriched_metadata.get("venue", ""),
+            year=int(enriched_metadata.get("year", 0) or 0),
+            abstract=enriched_metadata.get("abstract", ""),
+        )
+        resolved_metadata = enriched_metadata
+    except Exception:
+        pass
+    return opportunistic_user_library_full_text_ingest(
+        db_path,
+        paper_id,
+        url=url,
+        metadata=resolved_metadata,
+    )
+
+
+def start_user_library_enrichment(
+    db_path: Path,
+    paper_id: int,
+    *,
+    url: str,
+    title: str = "",
+    note: str = "",
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    def run() -> None:
+        enrich_user_library_paper(
+            db_path,
+            paper_id,
+            url=url,
+            title=title,
+            note=note,
+            metadata=metadata,
+        )
+
+    thread = threading.Thread(target=run, name=f"user-library-enrich-{int(paper_id)}", daemon=True)
+    thread.start()
+    return {"status": "queued"}
+
+
+def start_user_library_full_text_ingest(
+    db_path: Path,
+    paper_id: int,
+    *,
+    url: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return start_user_library_enrichment(
+        db_path,
+        paper_id,
+        url=url,
+        metadata=metadata,
+    )
 
 
 def get_user_library_paper(db_path: Path, paper_id: int) -> Any:
@@ -1949,6 +2142,11 @@ def parse_gui_scope(value: Any, *, default: str = "draft") -> str:
     return parsed or fallback
 
 
+def session_id_from_gui_scope(ui_scope: str) -> int:
+    match = re.fullmatch(r"session:(\d+)", str(ui_scope or "").strip())
+    return int(match.group(1)) if match else 0
+
+
 def parse_gui_choice(
     value: Any,
     *,
@@ -2063,6 +2261,337 @@ def run_app_command_streaming(
         "stdout": sanitize_user_facing_text("".join(stdout_parts)),
         "stderr": sanitize_user_facing_text("".join(stderr_parts)),
     }
+
+
+def run_gui_stable_ideate_session(
+    *,
+    root_dir: Path,
+    direction: str,
+    brief_direction: str,
+    provider: str,
+    lang: str,
+    review_rounds: int = 4,
+    on_output: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    session_summary = create_gui_conversation_idea_session(
+        root_dir=root_dir,
+        direction=direction,
+        brief_direction=brief_direction,
+        provider=provider,
+        lang=lang,
+        source="gui_stable_ideate",
+        strict_result=None,
+    )
+    session_id = int(session_summary["session_id"])
+    if on_output:
+        on_output("stdout", f"Auto session: #{session_id} {session_summary['name']}\n")
+    stdout = "\n".join(
+        line
+        for line in [
+            f"Auto session: #{session_id} {session_summary['name']}",
+            "Idea-session summary JSON: " + json.dumps(session_summary.get("chat_summary", {}), ensure_ascii=False, sort_keys=True),
+        ]
+        if line
+    )
+    return {
+        "command": "ra gui-stable-ideate",
+        "exit_code": 0,
+        "stdout": stdout,
+        "stderr": "",
+        "review_loop_exit_code": None,
+    }
+
+
+def refresh_gui_session_summary(root_dir: Path, summary: dict[str, Any]) -> dict[str, Any]:
+    config = load_config(root_dir)
+    session_id = int(summary.get("session_id", 0) or 0)
+    session = get_idea_session(config.db_path, session_id) if session_id else None
+    if not session:
+        return summary
+    refreshed = dict(summary)
+    current_idea = public_gui_text(session["current_idea"]).strip()
+    refreshed["current_idea"] = current_idea
+    chat_summary = dict(refreshed.get("chat_summary", {}) if isinstance(refreshed.get("chat_summary"), dict) else {})
+    chat_summary["session_id"] = session_id
+    chat_summary["current_idea"] = current_idea
+    refreshed["chat_summary"] = chat_summary
+    return refreshed
+
+
+def run_gui_stable_session_step(
+    *,
+    root_dir: Path,
+    session_id: int,
+    instruction: str,
+    provider: str,
+    on_output: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    config = load_config(root_dir)
+    ensure_layout(config)
+    init_db(config.db_path)
+    resolved_session_id = int(session_id)
+    session = get_idea_session(config.db_path, resolved_session_id)
+    if not session:
+        return {
+            "command": "ra gui-stable-step",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "Session not found.",
+        }
+    config.llm.provider = provider
+    provider_key = os.environ.get(provider_api_key_env(provider), "").strip()
+    generic_key = os.environ.get("RA_LLM_API_KEY", "").strip()
+    config.llm.api_key = provider_key or generic_key or config.llm.api_key
+    if on_output:
+        on_output("stdout", f"Stable session step: #{resolved_session_id}\n")
+    try:
+        from research_alpha.app import load_session_context, refresh_session_dossier, refresh_session_memory
+        from research_alpha.memory import build_compressed_session_context
+
+        turns = list_idea_session_turns(config.db_path, resolved_session_id)
+        session_context = load_session_context(session)
+        refresh_session_memory(config.root_dir, resolved_session_id, session_context)
+        session = get_idea_session(config.db_path, resolved_session_id) or session
+        compressed_context = build_compressed_session_context(session, turns, session_context)
+    except Exception:
+        refresh_session_dossier = None  # type: ignore[assignment]
+        refresh_session_memory = None  # type: ignore[assignment]
+        turns = list_idea_session_turns(config.db_path, resolved_session_id)
+        session_context = load_gui_session_context(session)
+        compressed_context = session_context
+    revised_idea = generate_gui_session_step_answer(
+        config,
+        session=session,
+        turns=turns,
+        session_context=compressed_context,
+        instruction=instruction,
+    )
+    content_payload = {
+        "source": "gui_stable_step",
+        "decision": "revised",
+        "revised_idea": revised_idea,
+        "user_instruction": instruction,
+        "user_visible_policy": "Only final conversation output is shown; strict evidence/review gates remain separate quality layers.",
+    }
+    turn_id = add_idea_session_turn(
+        config.db_path,
+        session_id=resolved_session_id,
+        user_instruction=instruction,
+        decision="revised",
+        revised_idea=revised_idea,
+        content_json=json.dumps(content_payload, ensure_ascii=False, indent=2),
+    )
+    memory: dict[str, Any] = {}
+    dossier_path = ""
+    try:
+        if refresh_session_memory is not None:
+            memory = refresh_session_memory(config.root_dir, resolved_session_id, session_context)
+        if refresh_session_dossier is not None:
+            _, path = refresh_session_dossier(config.root_dir, resolved_session_id)
+            dossier_path = str(path)
+    except Exception:
+        pass
+    stdout_lines = [
+        f"Turn {turn_id} decision: revised",
+        f"Revised idea: {public_gui_text(revised_idea).replace(chr(10), ' ').strip()}",
+    ]
+    if memory:
+        stdout_lines.append("Session memory JSON: " + json.dumps(memory, ensure_ascii=False, sort_keys=True))
+    if dossier_path:
+        stdout_lines.append(f"Dossier: {dossier_path}")
+    return {
+        "command": "ra gui-stable-step",
+        "exit_code": 0,
+        "stdout": "\n".join(stdout_lines),
+        "stderr": "",
+    }
+
+
+def create_gui_conversation_idea_session(
+    *,
+    root_dir: Path,
+    direction: str,
+    brief_direction: str,
+    provider: str,
+    lang: str,
+    source: str,
+    strict_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    config = load_config(root_dir)
+    ensure_layout(config)
+    init_db(config.db_path)
+    config.llm.provider = provider
+    provider_key = os.environ.get(provider_api_key_env(provider), "").strip()
+    generic_key = os.environ.get("RA_LLM_API_KEY", "").strip()
+    config.llm.api_key = provider_key or generic_key or config.llm.api_key
+    idea_text = generate_gui_conversation_idea(config, direction=direction, brief_direction=brief_direction, lang=lang)
+    name = compact_text_tail(direction, 48, public=True).strip() or "idea-session"
+    context = {
+        "source": source,
+        "status": "conversation_ready",
+        "original_direction": direction,
+        "brief_direction": brief_direction,
+        "strict_generation_status": "not_used_for_chat" if strict_result is None else "not_written",
+        "strict_exit_code": command_exit_code(strict_result) if strict_result is not None else 0,
+        "strict_failure_summary": build_public_conversation_summary({"kind": "ideate", "status": "failed", "result": strict_result}).get("failure", {}) if strict_result is not None else {},
+        "user_visible_policy": "This conversation idea is optimized for stable chat. Formal Gold scoring and candidate ranking remain separate quality layers.",
+    }
+    session_id = create_idea_session(
+        config.db_path,
+        name=name,
+        current_idea=idea_text,
+        context_json=json.dumps(context, ensure_ascii=False, indent=2),
+    )
+    try:
+        from research_alpha.app import refresh_session_dossier, refresh_session_memory
+
+        refresh_session_memory(config.root_dir, session_id, context)
+        _, dossier_path = refresh_session_dossier(config.root_dir, session_id)
+    except Exception:
+        dossier_path = config.output_dir / "sessions" / f"session-{session_id}-dossier.json"
+    return {
+        "session_id": session_id,
+        "name": name,
+        "current_idea": idea_text,
+        "dossier_path": str(dossier_path),
+        "chat_summary": {
+            "session_id": session_id,
+            "title": name,
+            "current_idea": idea_text,
+            "stable_conversation_idea": True,
+        },
+    }
+
+
+def generate_gui_session_step_answer(
+    config: Any,
+    *,
+    session: Any,
+    turns: list[Any],
+    session_context: dict[str, Any],
+    instruction: str,
+) -> str:
+    current_idea = public_gui_text(session["current_idea"]).strip()
+    previous_turns = [
+        {
+            "user": public_gui_text(turn["user_instruction"]),
+            "assistant": compact_text_tail(turn["revised_idea"], 900, public=True),
+        }
+        for turn in turns[-4:]
+    ]
+    preferred_language = "Chinese" if _gui_has_chinese([instruction, current_idea, session_context]) else "English"
+    prompt_payload = {
+        "current_idea": compact_text_tail(current_idea, 4200, public=True),
+        "user_instruction": public_gui_text(instruction),
+        "compressed_memory": _gui_compact_json(session_context, 2600),
+        "recent_turns": previous_turns,
+    }
+    prompt = (
+        "Revise or answer inside an existing Research Alpha idea conversation.\n"
+        "The user must receive a complete final answer even if formal evidence scoring would need later checks.\n"
+        "Keep the idea inside the logic space of excellent papers: problem setup, hidden assumption, mechanism, "
+        "evaluation boundary, reviewer attack surface. Do not copy a paper's surface method or force a rigid template.\n"
+        "User-library/domain papers, if present in memory, are background only; never treat them as Gold scoring standards.\n"
+        "If the user asks a question, answer it directly and update the idea only where useful.\n"
+        f"Write in {preferred_language}. Return only the final visible assistant message, no JSON, no logs.\n\n"
+        f"Context:\n{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}"
+    )
+    system_prompt = (
+        "You are Research Alpha's stable conversation editor. "
+        "Prioritize continuity and useful final output. "
+        "Preserve top-paper storyline logic without becoming templated. "
+        "Never expose chain-of-thought, internal review notes, raw evidence gates, paths, or logs."
+    )
+    try:
+        response = LLMClient(config.llm, timeout_seconds=45, max_retries=1, max_prompt_tokens=9000).chat(
+            prompt,
+            system_prompt=system_prompt,
+            temperature=0.32,
+            max_tokens=1000,
+        )
+        text = public_gui_text(response.text).strip()
+    except (LLMError, ValueError):
+        text = ""
+    if text:
+        return text
+    return build_gui_step_fallback_answer(
+        current_idea=current_idea,
+        instruction=instruction,
+        zh=_gui_has_chinese([instruction, current_idea]),
+    )
+
+
+def build_gui_step_fallback_answer(*, current_idea: str, instruction: str, zh: bool) -> str:
+    instruction_text = public_gui_text(instruction).strip()
+    idea_text = public_gui_text(current_idea).strip()
+    if not idea_text:
+        idea_text = "the current research idea" if not zh else "当前研究 idea"
+    if not instruction_text:
+        instruction_text = "revise the current idea" if not zh else "修改当前 idea"
+    if not zh:
+        return (
+            f"I would keep the current idea, but sharpen it around this request: {instruction_text}.\n\n"
+            f"Revised direction: {idea_text}\n\n"
+            "The strongest version should state one hidden assumption, one concrete failure boundary, and one prior-art difference that can be checked against the closest 5-10 recent papers. "
+            "If the requested change only renames an existing method, it should be rejected; if it reveals a new boundary or evaluation criterion, it becomes the next version to develop."
+        )
+    return (
+        f"我会保留当前 idea 的主线，但按你的要求收紧：{instruction_text}。\n\n"
+        f"修改后的方向：{idea_text}\n\n"
+        "更强的版本需要明确一个隐藏假设、一个可验证的失败边界，以及一个能和最近 5-10 篇相近工作区分开的 prior-art 差异。"
+        "如果这次修改只是换名词或套方法，就应该拒绝；如果它能暴露新的边界或评价准则，才值得作为下一版继续打磨。"
+    )
+
+
+def generate_gui_conversation_idea(config: Any, *, direction: str, brief_direction: str, lang: str) -> str:
+    language = "Chinese" if lang == "zh" else ("English" if lang == "en" else "the user's language")
+    prompt = (
+        f"User research direction: {direction}\n"
+        f"Normalized brief: {brief_direction}\n\n"
+        "Create one high-quality research idea for a stable chat answer. "
+        "The answer should be bold but defensible, and should sound like a real top-conference research direction rather than a generic API demo. "
+        "Do not copy a known paper method into the user's domain. Abstract a causal paper storyline first, then migrate that storyline into the user's domain. "
+        "Do not claim that the idea has already passed Gold evidence scoring or prior-art audit; instead, clearly state the novelty boundary and what evidence must be checked next.\n\n"
+        f"Write in {language}. Use this compact structure only:\n"
+        "Title:\n"
+        "Core idea:\n"
+        "Storyline transfer:\n"
+        "Novelty boundary:\n"
+        "Evidence to verify next:\n"
+    )
+    system_prompt = (
+        "You are Research Alpha's stable idea generator. "
+        "Your job is to produce one useful, specific, high-quality research idea on the first try. "
+        "Prefer abstract storyline migration over surface method transfer. Be concrete, cautious, and concise. Never expose internal logs."
+    )
+    try:
+        response = LLMClient(config.llm, timeout_seconds=45, max_retries=1).chat(
+            prompt,
+            system_prompt=system_prompt,
+            temperature=0.35,
+            max_tokens=900,
+        )
+        text = public_gui_text(response.text).strip()
+    except (LLMError, ValueError):
+        text = ""
+    if text:
+        return text
+    subject = public_gui_text(direction or brief_direction).strip() or "the user's research domain"
+    if lang == "en":
+        return (
+            f"Title: Evidence-Bounded Failure Discovery for {subject}\n\n"
+            f"Core idea: Build a research direction around the hidden failure boundaries in {subject}: collect repeated failure traces, extract the causal condition under which the current paradigm breaks, and turn that boundary into a testable hypothesis rather than another broad benchmark.\n\n"
+            "Storyline transfer: The migrated story is: a field over-trusts aggregate progress, the real bottleneck sits in an unmeasured boundary case, and the contribution is to make that boundary visible, reproducible, and useful for new method design.\n\n"
+            "Novelty boundary: Reject this if nearby work already discovers the same boundary mechanism; it is not enough to rename an existing benchmark or apply a known method to a new label.\n\n"
+            "Evidence to verify next: Read the 5-10 closest recent papers, especially introduction and limitations, and check whether the proposed boundary, discovery mechanism, and evaluation criterion are already present."
+        )
+    return (
+        f"标题：面向{subject}的证据边界失败发现\n\n"
+        f"核心想法：不要只沿着{subject}里已有的平均指标继续做增量优化，而是系统性收集失败轨迹，抽取其中反复出现的“证据边界”，再把这些边界转成可查重、可验证、可被审稿人攻击的研究假设。\n\n"
+        "故事线迁移：迁移的是优秀论文常见的逻辑弧线：领域原本相信整体指标，真正瓶颈藏在失败边界里，贡献不是换一个模型，而是把这个边界变成可度量、可复现、可被审稿人攻击的对象。\n\n"
+        "新颖性边界：如果它只是一个新的 benchmark 或 prompt 集合，就应该拒绝；它必须证明自己能发现现有评测没有命名的失败类型。\n\n"
+        f"下一步证据核验：先查最近与“{subject}”最相近的 5-10 篇工作，重点读 introduction 和 limitations，确认这个“失败边界发现机制”是否已经被做过，以及它和已有 benchmark、评测或方法论文的差异是否足够硬。"
+    )
 
 
 def extract_created_session_id(result: dict[str, Any] | None) -> int | None:
@@ -2203,9 +2732,9 @@ def build_gui_snapshot(root_dir: Path, state: GuiState, session_id: int | None =
             "remote_options": REMOTE_OPTIONS,
             "provider_options": PROVIDER_OPTIONS,
             "language_options": LANGUAGE_OPTIONS,
-            "default_gold_venues": ["ICLR", "NeurIPS", "ICML", "CVPR", "ICCV", "TPAMI"],
-            "default_from_year": 2024,
-            "default_to_year": 2026,
+            "default_gold_venues": ["ICLR", "NeurIPS", "ICML", "CVPR", "ICCV"],
+            "default_from_year": default_gold_from_year(),
+            "default_to_year": default_gold_to_year(),
         },
         "counts": counts,
         "readiness": readiness,
@@ -2429,6 +2958,18 @@ def describe_paper_quality_reason(paper: dict[str, Any]) -> str:
 
 def sanitize_user_facing_text(value: object) -> str:
     text = str(value or "")
+    text = re.sub(
+        r"Remote request failed with HTTP 429:[^\n]+",
+        "远程源限流或预算不足，已降级使用本地证据。",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\{[^\n{}]*(?:Too Many Requests|Insufficient budget|Rate limit exceeded)[^\n{}]*\}",
+        "远程源限流或预算不足，已降级使用本地证据。",
+        text,
+        flags=re.IGNORECASE,
+    )
     replacements = [
         (r"（请用中文输出idea标题、解释、风险和实验计划）", ""),
         (r"\(Please return idea titles, explanations, risks, and experiment plans in English\.\)", ""),
@@ -2443,6 +2984,22 @@ def sanitize_user_facing_text(value: object) -> str:
 
 def public_gui_text(value: object) -> str:
     return redact_secrets(redact_local_paths(sanitize_user_facing_text(value))).strip()
+
+
+def _gui_has_chinese(value: object) -> bool:
+    if isinstance(value, dict):
+        return any(_gui_has_chinese(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_gui_has_chinese(item) for item in value)
+    return bool(re.search(r"[\u4e00-\u9fff]", str(value or "")))
+
+
+def _gui_compact_json(value: object, limit: int) -> object:
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        text = str(value or "")
+    return compact_text_tail(text, limit, public=True)
 
 
 def session_row_to_card(row: Any) -> dict[str, Any]:
@@ -2742,9 +3299,6 @@ def build_chat_snapshot(root_dir: Path, session_id: int | None = None) -> dict[s
     turns = list_idea_session_turns(config.db_path, session_id)
     session_context = load_gui_session_context(session)
     seed_text = public_gui_text(session["initial_idea"]) or public_gui_text(session["current_idea"])
-    evidence_text = build_evidence_message_for_session(session_context)
-    if evidence_text:
-        seed_text = f"{seed_text}\n\n{evidence_text}"
     messages: list[dict[str, Any]] = [
         {
             "role": "assistant",
@@ -2753,7 +3307,11 @@ def build_chat_snapshot(root_dir: Path, session_id: int | None = None) -> dict[s
             "meta": f"Session #{session_id} · {public_gui_text(session['name'])}",
         }
     ]
+    hidden_turns = []
     for turn in turns:
+        if should_hide_gui_turn(turn):
+            hidden_turns.append(turn)
+            continue
         messages.append(
             {
                 "role": "user",
@@ -2767,11 +3325,6 @@ def build_chat_snapshot(root_dir: Path, session_id: int | None = None) -> dict[s
             payload = json.loads(str(turn["content_json"]))
         except json.JSONDecodeError:
             payload = {}
-        if isinstance(payload, dict):
-            verdict = str(payload.get("verdict_summary", "")).strip()
-            coach = str(payload.get("coach_message", "")).strip()
-            if verdict or coach:
-                assistant_text = "\n\n".join(public_gui_text(item) for item in [assistant_text, verdict, coach] if item)
         messages.append(
             {
                 "role": "assistant",
@@ -2780,19 +3333,75 @@ def build_chat_snapshot(root_dir: Path, session_id: int | None = None) -> dict[s
                 "meta": f"decision: {public_gui_text(turn['decision'])}",
             }
         )
-    if not turns and str(session["current_idea"]).strip() != str(session["initial_idea"]).strip():
+    review_message = build_latest_review_chat_message(session_context)
+    if review_message:
+        messages.append(review_message)
+    current_idea_changed = str(session["current_idea"]).strip() != str(session["initial_idea"]).strip()
+    latest_turn_hidden = bool(turns and should_hide_gui_turn(turns[-1]))
+    if current_idea_changed and (not turns or latest_turn_hidden):
         messages.append(
             {
                 "role": "assistant",
                 "kind": "current",
                 "text": public_gui_text(session["current_idea"]),
-                "meta": "current best",
+                "meta": "final idea" if latest_turn_hidden else "current best",
             }
         )
     return {
         "active": True,
         "session": session_row_to_card(session),
         "messages": messages,
+    }
+
+
+def should_hide_gui_turn(turn: Any) -> bool:
+    try:
+        instruction = str(turn["user_instruction"] or "")
+    except (KeyError, IndexError):
+        instruction = ""
+    try:
+        payload = json.loads(str(turn["content_json"] or "{}"))
+    except json.JSONDecodeError:
+        payload = {}
+    source = str(payload.get("source", "")).strip() if isinstance(payload, dict) else ""
+    if source in {"review_loop_refinement", "implicit_review_refinement"}:
+        return True
+    if isinstance(payload, dict) and payload.get("hidden_in_gui_chat"):
+        return True
+    return instruction.startswith("根据第 ") and "轮顶会审稿意见改写当前 idea" in instruction
+
+
+def build_latest_review_chat_message(context: dict[str, Any]) -> dict[str, Any] | None:
+    history = context.get("review_history") if isinstance(context, dict) else None
+    if not isinstance(history, list) or not history:
+        return None
+    latest = next((item for item in reversed(history) if isinstance(item, dict)), None)
+    if not latest:
+        return None
+    lines: list[str] = []
+    summary = public_gui_text(latest.get("summary", ""))
+    decision = public_gui_text(latest.get("decision", ""))
+    if summary:
+        lines.append(f"审稿意见：{summary}")
+    elif decision:
+        lines.append(f"审稿意见：{decision}")
+    attacks = latest.get("fatal_flaws") or latest.get("main_attacks") or []
+    if isinstance(attacks, list) and attacks:
+        attack = public_gui_text(attacks[0])
+        if attack:
+            lines.append(f"主要漏洞：{attack}")
+    required = latest.get("required_rethink") or latest.get("missing_logic_links") or []
+    if isinstance(required, list) and required:
+        action = public_gui_text(required[0])
+        if action:
+            lines.append(f"建议修改：{action}")
+    if not lines:
+        return None
+    return {
+        "role": "assistant",
+        "kind": "review-note",
+        "text": "\n".join(lines[:3]),
+        "meta": "review",
     }
 
 
@@ -2965,7 +3574,7 @@ def build_gui_score_message(value: object) -> str:
 
 
 def render_index_html() -> str:
-    return r"""<!doctype html>
+    html = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
@@ -3071,7 +3680,7 @@ def render_index_html() -> str:
     .library-grid { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px; max-width:980px; margin:0 auto; }
     .library-panel { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; box-shadow:var(--shadow-soft); min-width:0; }
     .library-panel.flash { border-color:rgba(17,24,39,.18); box-shadow:0 8px 22px rgba(17,24,39,.05); }
-    .user-library-main { grid-column:1 / -1; }
+    .user-library-main, .evidence-build-main { grid-column:1 / -1; }
     .library-panel.collapsed { align-self:start; }
     .library-panel.collapsed .library-body { display:none; }
     .library-toggle { width:100%; min-height:auto; padding:9px 10px; display:flex; align-items:center; justify-content:space-between; gap:8px; background:#fbfbfd; color:inherit; border:1px solid var(--line); border-radius:8px; text-align:left; }
@@ -3107,6 +3716,10 @@ def render_index_html() -> str:
     .paper-row:hover .paper-status, .paper-row:focus-visible .paper-status { border-color:rgba(17,24,39,.14); }
     .paper-reason a { color:#374151; text-decoration:none; font-weight:760; }
     .user-library-block { margin-top:14px; padding-top:14px; border-top:1px solid var(--line); }
+    .evidence-build-copy { color:#4b5563; font-size:12px; line-height:1.55; margin:2px 0 12px; }
+    .evidence-build-controls { display:grid; gap:8px; }
+    .evidence-actions { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:6px; }
+    .evidence-actions button { min-height:40px; border-radius:6px; }
     .user-library-form { display:grid; gap:8px; margin-top:10px; padding:12px; border:1px solid rgba(17,24,39,.08); border-radius:8px; background:rgba(255,255,255,.62); backdrop-filter:saturate(145%) blur(14px); -webkit-backdrop-filter:saturate(145%) blur(14px); }
     .user-library-form .row { gap:8px; }
     .user-library-form label { margin:0 0 4px; }
@@ -3501,7 +4114,7 @@ def render_index_html() -> str:
     <div class="toolbar">
       <div class="status-cluster">
         <span id="healthDot" class="health-dot bad" aria-hidden="true"></span>
-        <button id="provider" class="status-pill" onclick="metricAction('settings')" title="查看模型与检索设置">加载中</button>
+        <button id="provider" class="status-pill" onclick="metricAction('model-settings')" title="查看模型与对话设置">加载中</button>
         <button id="strictStatus" class="status-pill" onclick="metricAction('excellent')" title="查看核心优秀论文库">检查中</button>
       </div>
     </div>
@@ -3546,6 +4159,30 @@ def render_index_html() -> str:
         </div>
       </div>
       <div class="library-grid">
+        <div id="evidenceBuildPanel" class="library-panel evidence-build-main">
+          <button id="evidenceBuildPanelToggle" class="library-toggle" onclick="toggleLibraryPanel('evidenceBuildPanel')" aria-expanded="true"><h2>扩充优秀论文库</h2><span class="section-right"><span class="pill">官方源</span><span class="library-toggle-icon">−</span></span></button>
+          <div class="library-body">
+            <div class="evidence-build-copy">核心库只接受 Best、Nominee、Outstanding 或 Oral 等强信号；普通论文和元数据来源先进入趋势区。</div>
+            <div class="evidence-build-controls">
+              <label>会议组合</label>
+              <div id="venuePresets" class="chips"></div>
+              <details style="margin-top:10px">
+                <summary>细选会议</summary>
+                <label>会议分组</label><div id="venueTabs" class="tabs"></div>
+                <label>会议选项</label><div id="venueGroups"></div>
+              </details>
+              <div id="selectedVenueStrip" class="selected-strip"></div>
+              <label>主题过滤</label><input id="goldQuery" placeholder="可选，例如 research agents / multimodal reasoning" />
+              <div class="row"><div><label>起始年份</label><input id="fromYear" type="number" value="${defaultFromYear}" /></div><div><label>结束年份</label><input id="toYear" type="number" value="${defaultToYear}" /></div></div>
+              <label>每个会议年份最多核验</label><input id="perVenue" type="number" min="2" max="40" value="8" />
+              <label class="switchline"><input id="extractiveGenomes" type="checkbox" checked /> 同时生成可审计逻辑卡</label>
+              <div class="panel-actions evidence-actions">
+                <button onclick="goldBuild()">扩充核心库</button>
+                <button class="ghost" onclick="qualityEnrich()">核验趋势质量</button>
+              </div>
+            </div>
+          </div>
+        </div>
         <div id="userLibraryPanel" class="library-panel user-library-main"></div>
         <div id="papers" class="library-panel"></div>
         <div id="ideas" class="library-panel"></div>
@@ -3555,30 +4192,19 @@ def render_index_html() -> str:
     </section>
     <section class="side-rail">
       <div class="section-title"><div><div class="workspace-kicker">Run setup</div><div class="workspace-title">Evidence</div></div><button class="ghost" onclick="refresh()">刷新</button></div>
-      <div class="tool-panel accent action-panel" role="button" tabindex="0" onclick="panelNavigate(event, 'excellent')" onkeydown="activatePanel(event, 'excellent')" title="查看核心优秀论文库">
+      <div class="tool-panel accent action-panel" role="button" tabindex="0" onclick="panelNavigate(event, 'evidence-build')" onkeydown="activatePanel(event, 'evidence-build')" title="扩充或查看核心优秀论文库">
         <div class="mini-kicker">Evidence</div>
         <div class="section-title"><div class="title">优秀论文逻辑库</div><span class="tooltip-anchor" tabindex="0" data-tooltip="核心参考只使用 CVPR、ICCV、ICLR、NeurIPS/NIPS、ICML、TPAMI 这类高水平来源的 Best、Nominee 和 Oral；其他会议只作辅助来源，高引用不单独入库。">?</span></div>
         <div class="action-panel-link">核心库</div>
         <div class="panel-actions">
           <button onclick="goldBuild()">扩充核心库</button>
-          <button class="ghost" onclick="reviewLoop()">循环审稿</button>
+          <button class="ghost" onclick="qualityEnrich()">核验趋势</button>
+          <button class="ghost" onclick="metricAction('library')">打开证据库</button>
         </div>
       </div>
       <div id="sideUserLibrary" class="user-library-tab" role="button" tabindex="0" onclick="panelNavigate(event, 'user-library')" onkeydown="activatePanel(event, 'user-library')"></div>
-      <details id="searchSettings" class="settings">
+      <details id="searchSettings" class="settings side-model-settings">
         <summary>检索设置</summary>
-        <label>会议组合</label>
-        <div id="venuePresets" class="chips"></div>
-        <details style="margin-top:10px">
-          <summary>细选会议</summary>
-          <label>会议分组</label><div id="venueTabs" class="tabs"></div>
-          <label>会议选项</label><div id="venueGroups"></div>
-        </details>
-        <div id="selectedVenueStrip" class="selected-strip"></div>
-        <label>主题过滤</label><input id="goldQuery" placeholder="可选，例如 research agents / multimodal reasoning" />
-        <div class="row"><div><label>起始年份</label><input id="fromYear" type="number" value="2024" /></div><div><label>结束年份</label><input id="toYear" type="number" value="2026" /></div></div>
-        <label>每个会议年份最多核验</label><input id="perVenue" type="number" min="2" max="40" value="8" />
-        <label class="switchline"><input id="extractiveGenomes" type="checkbox" checked /> 同时生成可审计逻辑卡</label>
         <div class="row">
           <div><label>近期趋势源</label><select id="remote"></select></div>
           <div><label>输出语言</label><select id="lang"></select></div>
@@ -3588,12 +4214,12 @@ def render_index_html() -> str:
           <div><label>idea 数</label><input id="ideaCount" type="number" min="1" max="8" value="3" /></div>
         </div>
         <label>近期文章检索上限</label><input id="limit" type="number" min="4" max="50" value="12" />
-        <div class="control-note"><span class="tooltip-anchor" tabindex="0" data-tooltip="生成 idea 时会从对话抽取方向与约束；核心来源会路由到官方奖项页、OpenReview 或元数据核验源。">?</span> 自动抽取</div>
+        <div class="control-note"><span class="tooltip-anchor" tabindex="0" data-tooltip="生成 idea 时会从对话抽取方向与约束；扩充优秀论文库的会议和年份在 Evidence library 中设置。">?</span> 对话生成设置</div>
       </details>
       <div class="tool-panel action-panel" role="button" tabindex="0" onclick="panelNavigate(event, 'chat')" onkeydown="activatePanel(event, 'chat')" title="回到对话查看任务进度">
         <div class="section-title"><h2>Activity</h2><span id="jobCount" class="pill">0</span></div>
         <div class="action-panel-link">进度</div>
-        <button id="jobFeed" class="status-mini status-link" onclick="metricAction('chat')" title="任务结果只会出现在中间对话">空闲</button>
+        <button id="jobFeed" class="status-mini status-link" onclick="metricAction('runs')" title="证据任务只显示简短状态，结果进入证据库">空闲</button>
       </div>
     </section>
   </main>
@@ -3619,6 +4245,7 @@ def render_index_html() -> str:
     let pendingIdeateJobsByScope = {};
     let pendingSearchesByScope = {};
     let progressByScope = {};
+    const evidenceScopeId = 'evidence:global';
     let isBusy = false;
     let awaitingJobStart = false;
     let awaitingJobStartByScope = {};
@@ -3662,6 +4289,19 @@ def render_index_html() -> str:
       const prefix = [status, code].filter(Boolean).join(' · ');
       return prefix ? `${prefix}：${message}` : message;
     }
+    function chatSessionIdFromLastData() {
+      const chat = (window.lastData || {}).chat || {};
+      return chat && chat.active && chat.session && chat.session.id ? Number(chat.session.id) : 0;
+    }
+    function currentSessionIdForSubmit() {
+      if (activeSessionId && !newChatMode) return Number(activeSessionId);
+      const fromChat = chatSessionIdFromLastData();
+      if (fromChat && !newChatMode) {
+        activeSessionId = fromChat;
+        return fromChat;
+      }
+      return 0;
+    }
     function handleUiFailure(scope, label, error, options={}) {
       const message = cleanUiText(requestErrorMessage(error));
       const nextAction = error && error.nextAction ? cleanUiText(error.nextAction) : (error && error.retryable ? '刷新状态后重试。' : '按提示修正输入后重试。');
@@ -3672,7 +4312,7 @@ def render_index_html() -> str:
       if (options.clearSearch) removePendingSearch(scope);
       if (options.restoreText) restoreSubmittedInstruction(scope, options.restoreText);
       setScopeMessages(transientMessagesByScope, scope, scopeMessages(transientMessagesByScope, scope).filter(m => !m.thinking));
-      pushActivityMessage(`${label}没有提交成功：${message}\n\n下一步：${nextAction}`, '请求失败', scope);
+      if (!options.silentChatFailure) pushActivityMessage(`${label}没有提交成功：${message}\n\n下一步：${nextAction}`, '请求失败', scope);
       renderSessionHistory(window.lastData || {});
       renderChat((window.lastData || {}).chat || {active:chatActive, messages:[]});
       renderLiveProgress(scope);
@@ -3704,13 +4344,14 @@ def render_index_html() -> str:
         if (options.restoreText) restoreSubmittedInstruction(scope, options.restoreText);
         removeTransientThinking(scope);
         const nextAction = error && error.nextAction ? cleanUiText(error.nextAction) : '刷新状态后重试。';
-        pushActivityMessage(`${label}没有提交成功：${cleanUiText(requestErrorMessage(error))}\n\n下一步：${nextAction}`, '请求失败', scope);
+        if (!options.silentChatFailure) pushActivityMessage(`${label}没有提交成功：${cleanUiText(requestErrorMessage(error))}\n\n下一步：${nextAction}`, '请求失败', scope);
         scheduleRefresh(700);
         return;
       }
       handleUiFailure(scope, label, error, options);
     }
     function currentScope() { return activeSessionId && !newChatMode ? `session:${activeSessionId}` : draftScopeId; }
+    function evidenceScope() { return evidenceScopeId; }
     function instructionEl() { return document.getElementById('instruction'); }
     function autosizeInstruction() {
       const instruction = instructionEl();
@@ -3857,23 +4498,12 @@ def render_index_html() -> str:
       if (job) mergeJobIntoLastData(job);
       setAwaitingJobStart(scope, false);
       removeTransientThinking(scope);
-      pushActivityMessage(message + ' 我会继续显示已有任务的实时进度和最终结果。', '任务 · 继续等待', scope);
+      if (!isConversationBlockingJob(job)) pushActivityMessage(message + ' 可以在 Activity 和证据库里看最终状态。', '任务 · 继续等待', scope);
       renderLiveProgress(scope);
     }
     function isCoreGoldVenue(value) { return CORE_GOLD_UI_VENUES.has(String(value || '').trim().toLowerCase()); }
     function coreGoldVenueValues(values) { return (values || []).filter(isCoreGoldVenue); }
     function auxiliaryGoldVenueValues(values) { return (values || []).filter(value => !isCoreGoldVenue(value)); }
-    function sourcePlanNote(plan) {
-      const items = Array.isArray(plan) ? plan : [];
-      const lines = items.map(item => {
-        if (!item || typeof item !== 'object') return '';
-        const venues = Array.isArray(item.venues) ? item.venues.join('、') : '';
-        const label = item.label || item.remote || '来源';
-        const mode = item.mode === 'metadata_only' ? '先入趋势区，quality-enrich 核验后才可进 Gold' : '直接按 Best/Nominee/Oral 严格入库';
-        return venues ? `${venues} → ${label}（${mode}）` : '';
-      }).filter(Boolean);
-      return lines.length ? `\n\n核心优秀论文源路由：\n${lines.join('\n')}` : '';
-    }
     function mergeJobIntoLastData(job) {
       if (!job || !job.id) return;
       const data = window.lastData || {};
@@ -3914,9 +4544,12 @@ def render_index_html() -> str:
       const jobs = ((window.lastData || {}).jobs || []);
       return scopeAwaitingJobStart(scope) || Boolean(pendingIdeateForScope(scope)) || runningConversationJobsForScope(jobs, scope).length > 0;
     }
-    function scopeHasRunningEvidenceJob(scope) {
+    function scopeHasRunningEvidenceJob(scope=evidenceScope()) {
       const jobs = ((window.lastData || {}).jobs || []);
       return runningJobsForScope(jobs, scope).some(job => !isConversationBlockingJob(job));
+    }
+    function evidenceIsBusy() {
+      return scopeAwaitingJobStart(evidenceScope()) || scopeHasRunningEvidenceJob(evidenceScope());
     }
     function reconcilePendingIdeates(jobs, excludeScope='') {
       const jobList = jobs || [];
@@ -3998,11 +4631,6 @@ def render_index_html() -> str:
       clearProgress(jobScope);
       removePendingSearch(jobScope);
       if (createdScope && jobScope) adoptDraftMessagesToSession(Number(job.created_session_id), jobScope);
-      if (!createdScope) {
-        const targetScope = jobScope;
-        const activity = jobActivity(job);
-        setScopeMessages(activityMessagesByScope, targetScope, scopeMessages(activityMessagesByScope, targetScope).filter(m => m.job_id !== job.id).concat([activity]).slice(-8));
-      }
       setScopeMessages(transientMessagesByScope, jobScope, scopeMessages(transientMessagesByScope, jobScope).filter(m => !m.thinking));
       lastJobStatuses.set(key, job.status);
       lastJobStatuses.set(job.id, job.status);
@@ -4036,18 +4664,12 @@ def render_index_html() -> str:
     async function ideate(direction) {
       const scope = currentScope();
       const token = currentViewToken();
-      if (scopeHasRunningEvidenceJob(scope)) {
-        restoreSubmittedInstruction(scope, direction);
-        pushActivityMessage('已有证据任务在后台运行，本次不重复提交；你可以继续在对话框里补充研究方向。', '任务 · 继续等待', scope);
-        renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]});
-        return;
-      }
       setBusy(true);
       setAwaitingJobStart(scope, true);
       addPendingSearch(scope, direction);
       startProgress(scope, 'ideate', direction);
       pushUserMessage(direction, scope);
-      pushThinking('正在检索论文、生成 idea，并自动进行审稿循环', scope);
+      pushThinking('正在生成 idea', scope);
       setPendingIdeate(scope);
       renderSessionHistory(window.lastData || {});
       renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:false, messages:[]});
@@ -4067,21 +4689,25 @@ def render_index_html() -> str:
         }
         mergeJobIntoLastData(res && res.job);
         setPendingIdeate(scope, res && res.job ? Number(res.job.id) : null);
-        pushActivityMessage('任务已提交：会先生成候选 idea，再自动经过审稿专家循环，最后写入新对话。', '任务 · 已开始', scope);
         setAwaitingJobStart(scope, false);
         renderLiveProgress(scope);
         await refreshIfCurrent(token, scope);
       } catch (error) {
-        handleUiFailureIfCurrent(token, scope, 'idea 生成任务', error, {clearIdeate:true, clearSearch:true, restoreText:direction});
+        handleUiFailureIfCurrent(token, scope, 'idea 生成任务', error, {clearIdeate:true, clearSearch:true, restoreText:direction, silentChatFailure:true});
       }
     }
     async function step(instruction) {
-      const scope = currentScope();
+      const submitSessionId = currentSessionIdForSubmit();
+      const scope = submitSessionId ? sessionScopeForId(submitSessionId) : currentScope();
       const token = currentViewToken();
       if (!instruction) return;
+      if (!submitSessionId) {
+        restoreSubmittedInstruction(scope, instruction);
+        await ideate(instruction);
+        return;
+      }
       if (scopeIsBusy(scope)) {
         restoreSubmittedInstruction(scope, instruction);
-        pushActivityMessage('当前对话已有回复在运行，我已保留这次输入；等上一轮完成后可以直接发送。', '任务 · 继续等待', scope);
         renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:true, messages:[]});
         return;
       }
@@ -4092,7 +4718,7 @@ def render_index_html() -> str:
       pushThinking('正在思考', scope);
       renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:true, messages:[]});
       try {
-        const res = await postJson('/api/step', {instruction, session_id:activeSessionId, ui_scope:scope, provider:val('providerSelect')});
+        const res = await postJson('/api/step', {instruction, session_id:submitSessionId, ui_scope:scope, provider:val('providerSelect')});
         if (!viewStillCurrent(token, scope)) {
           mergeJobIntoLastData(res && res.job);
           setAwaitingJobStart(scope, false);
@@ -4105,12 +4731,11 @@ def render_index_html() -> str:
           return;
         }
         mergeJobIntoLastData(res && res.job);
-        pushActivityMessage('任务已提交：正在基于当前会话记忆和证据上下文继续思考。', '任务 · 已开始', scope);
         setAwaitingJobStart(scope, false);
         renderLiveProgress(scope);
         await refreshIfCurrent(token, scope);
       } catch (error) {
-        handleUiFailureIfCurrent(token, scope, '继续对话任务', error, {restoreText:instruction});
+        handleUiFailureIfCurrent(token, scope, '继续对话任务', error, {restoreText:instruction, silentChatFailure:true});
       }
     }
     async function sendChat() {
@@ -4118,88 +4743,79 @@ def render_index_html() -> str:
       const text = takeInstructionForSubmit(scope);
       if (!text) return;
       showChat();
-      if (chatActive && !newChatMode) await step(text);
+      if (activeSessionId && !newChatMode) await step(text);
+      else if (currentSessionIdForSubmit()) await step(text);
       else await ideate(text);
     }
-    async function review() { const scope=currentScope(); const token=currentViewToken(); if (!activeSessionId || scopeIsBusy(scope)) return; setBusy(true); setAwaitingJobStart(scope, true); startProgress(scope, 'review', '审稿人视角'); pushThinking('审稿人正在攻击这个 idea', scope); renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]}); try { const res = await postJson('/api/review', {session_id:activeSessionId, ui_scope:scope, provider:val('providerSelect')}); if (!viewStillCurrent(token, scope)) { mergeJobIntoLastData(res && res.job); setAwaitingJobStart(scope, false); scheduleRefresh(700); return; } if (res && res.deduped) { handleDedupedJob(scope, res.job, '当前对话已有审稿任务在运行，本次没有重复提交。'); await refreshIfCurrent(token, scope); return; } mergeJobIntoLastData(res && res.job); pushActivityMessage('任务已提交：审稿人视角会先攻击 novelty、证据链和可行性。', '任务 · 已开始', scope); setAwaitingJobStart(scope, false); renderLiveProgress(scope); await refreshIfCurrent(token, scope); } catch (error) { handleUiFailureIfCurrent(token, scope, '审稿人任务', error); } }
-    async function reviewLoop() { const scope=currentScope(); const token=currentViewToken(); if (!activeSessionId || scopeIsBusy(scope)) return; setBusy(true); setAwaitingJobStart(scope, true); startProgress(scope, 'review-loop', '审稿循环'); pushThinking('正在进行多轮审稿和自动改写', scope); renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]}); try { const res = await postJson('/api/review-loop', {session_id:activeSessionId, ui_scope:scope, rounds:4, provider:val('providerSelect')}); if (!viewStillCurrent(token, scope)) { mergeJobIntoLastData(res && res.job); setAwaitingJobStart(scope, false); scheduleRefresh(700); return; } if (res && res.deduped) { handleDedupedJob(scope, res.job, '当前对话已有审稿循环在运行，本次没有重复提交。'); await refreshIfCurrent(token, scope); return; } mergeJobIntoLastData(res && res.job); pushActivityMessage('任务已提交：会自动经过 3-5 轮审稿专家攻击和改写，再保留最终 idea。', '任务 · 已开始', scope); setAwaitingJobStart(scope, false); renderLiveProgress(scope); await refreshIfCurrent(token, scope); } catch (error) { handleUiFailureIfCurrent(token, scope, '审稿循环任务', error); } }
+    async function review() { const scope=currentScope(); const token=currentViewToken(); if (!activeSessionId || scopeIsBusy(scope)) return; setBusy(true); setAwaitingJobStart(scope, true); startProgress(scope, 'review', '审稿人视角'); renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]}); try { const res = await postJson('/api/review', {session_id:activeSessionId, ui_scope:scope, provider:val('providerSelect')}); if (!viewStillCurrent(token, scope)) { mergeJobIntoLastData(res && res.job); setAwaitingJobStart(scope, false); scheduleRefresh(700); return; } if (res && res.deduped) { handleDedupedJob(scope, res.job, '当前对话已有审稿任务在运行，本次没有重复提交。'); await refreshIfCurrent(token, scope); return; } mergeJobIntoLastData(res && res.job); setAwaitingJobStart(scope, false); renderLiveProgress(scope); await refreshIfCurrent(token, scope); } catch (error) { handleUiFailureIfCurrent(token, scope, '审稿人任务', error, {silentChatFailure:true}); } }
+    async function reviewLoop() { const scope=currentScope(); const token=currentViewToken(); if (!activeSessionId || scopeIsBusy(scope)) return; setBusy(true); setAwaitingJobStart(scope, true); startProgress(scope, 'review-loop', '审稿循环'); renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]}); try { const res = await postJson('/api/review-loop', {session_id:activeSessionId, ui_scope:scope, rounds:4, provider:val('providerSelect')}); if (!viewStillCurrent(token, scope)) { mergeJobIntoLastData(res && res.job); setAwaitingJobStart(scope, false); scheduleRefresh(700); return; } if (res && res.deduped) { handleDedupedJob(scope, res.job, '当前对话已有审稿循环在运行，本次没有重复提交。'); await refreshIfCurrent(token, scope); return; } mergeJobIntoLastData(res && res.job); setAwaitingJobStart(scope, false); renderLiveProgress(scope); await refreshIfCurrent(token, scope); } catch (error) { handleUiFailureIfCurrent(token, scope, '审稿循环任务', error, {silentChatFailure:true}); } }
     async function goldBuild() {
-      showChat();
-      const scope = currentScope();
-      const token = currentViewToken();
-      if (scopeIsBusy(scope)) return;
+      const scope = evidenceScope();
+      if (evidenceIsBusy()) return;
       const selected = [...selectedVenues];
       const coreVenues = coreGoldVenueValues(selected);
       const auxiliaryVenues = auxiliaryGoldVenueValues(selected);
       if (!coreVenues.length) {
-        pushActivityMessage(`核心优秀论文库只接受 ICLR、NeurIPS/NIPS、ICML、CVPR、ICCV、TPAMI。\n\n已选择的辅助来源仅作趋势参考：${auxiliaryVenues.join('、') || '无'}。`, '请求失败', scope);
-        renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]});
+        const feed = document.getElementById('jobFeed');
+        if (feed) {
+          feed.textContent = '请选择核心会议后重试';
+          feed.title = `核心优秀论文库只接受 ICLR、NeurIPS/NIPS、ICML、CVPR、ICCV、TPAMI。已选择：${auxiliaryVenues.join('、') || '无'}`;
+        }
         return;
       }
-      setBusy(true);
       setAwaitingJobStart(scope, true);
       startProgress(scope, 'gold-build', '扩充核心优秀论文库');
-      pushThinking('正在联网扩充核心优秀论文库', scope);
-      renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]});
+      renderJobs(window.lastData || {});
       try {
         const res = await postJson('/api/gold-build', {venues:coreVenues, query:val('goldQuery'), from_year:num('fromYear'), to_year:num('toYear'), per_venue_year:num('perVenue'), extractive_genomes:document.getElementById('extractiveGenomes').checked, ui_scope:scope});
-        if (!viewStillCurrent(token, scope)) {
-          (res && res.jobs || []).forEach(mergeJobIntoLastData);
-          setAwaitingJobStart(scope, false);
-          scheduleRefresh(700);
-          return;
-        }
         if (res && res.deduped) {
-          handleDedupedJob(scope, res.job, '当前范围已有优秀论文库扩充任务在运行，本次没有重复提交。');
-          await refreshIfCurrent(token, scope);
+          mergeJobIntoLastData(res && res.job);
+          setAwaitingJobStart(scope, false);
+          renderJobs(window.lastData || {});
+          scheduleRefresh(700);
           return;
         }
         (res && res.jobs || []).forEach(mergeJobIntoLastData);
-        const count = res && res.jobs ? res.jobs.length : 1;
-        const serverAuxiliary = res && res.auxiliary_venues ? res.auxiliary_venues : [];
-        const auxiliary = auxiliaryVenues.concat(serverAuxiliary).filter((value, index, arr) => arr.indexOf(value) === index);
-        const auxiliaryNote = auxiliary.length ? `\n\n未提交到核心 Gold：${auxiliary.join('、')} 只作为趋势参考，不参与 idea 评分标准。` : '';
-        const metadataOnly = res && res.metadata_only_venues ? res.metadata_only_venues : [];
-        const metadataOnlyNote = metadataOnly.length ? `\n\n${metadataOnly.join('、')} 当前通过 OpenAlex 元数据收集：先写入趋势区；只有后续质量核验确认 Best / Nominee / Oral 等明确优秀信号后，才会进入核心优秀依据库。` : '';
-        const planNote = sourcePlanNote(res && res.source_plan);
-        pushActivityMessage(`任务已提交：${count} 个官方优秀论文源正在联网拉取。Poster 会被硬过滤，普通论文只进入趋势区。${planNote}${auxiliaryNote}${metadataOnlyNote}`, '任务 · 已开始', scope);
         setAwaitingJobStart(scope, false);
-        renderLiveProgress(scope);
-        await refreshIfCurrent(token, scope);
+        renderJobs(window.lastData || {});
+        scheduleRefresh(700);
       } catch (error) {
-        handleUiFailureIfCurrent(token, scope, '核心优秀论文库扩充任务', error);
+        setAwaitingJobStart(scope, false);
+        clearProgress(scope);
+        const feed = document.getElementById('jobFeed');
+        if (feed) {
+          feed.textContent = '扩充任务没有提交成功';
+          feed.title = cleanUiText(requestErrorMessage(error));
+        }
       }
     }
     async function qualityEnrich() {
-      showChat();
-      const scope = currentScope();
-      const token = currentViewToken();
-      if (scopeIsBusy(scope)) return;
-      setBusy(true);
+      const scope = evidenceScope();
+      if (evidenceIsBusy()) return;
       setAwaitingJobStart(scope, true);
       startProgress(scope, 'quality-enrich', '证据质量审查');
-      pushThinking('正在核验趋势论文质量标签', scope);
-      renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]});
+      renderJobs(window.lastData || {});
       try {
         const res = await postJson('/api/quality-enrich', {limit:Math.max(10, num('perVenue')), provider:val('providerSelect'), ui_scope:scope});
-        if (!viewStillCurrent(token, scope)) {
+        if (res && res.deduped) {
           mergeJobIntoLastData(res && res.job);
           setAwaitingJobStart(scope, false);
+          renderJobs(window.lastData || {});
           scheduleRefresh(700);
           return;
         }
-        if (res && res.deduped) {
-          handleDedupedJob(scope, res.job, '当前范围已有证据质量审查在运行，本次没有重复提交。');
-          await refreshIfCurrent(token, scope);
-          return;
-        }
         mergeJobIntoLastData(res && res.job);
-        pushActivityMessage('任务已提交：正在核验趋势论文是否有核心最佳、提名或 Oral 信号；Spotlight/高引用只作辅助发现线索。', '任务 · 已开始', scope);
         setAwaitingJobStart(scope, false);
-        renderLiveProgress(scope);
-        await refreshIfCurrent(token, scope);
+        renderJobs(window.lastData || {});
+        scheduleRefresh(700);
       } catch (error) {
-        handleUiFailureIfCurrent(token, scope, '证据质量审查任务', error);
+        setAwaitingJobStart(scope, false);
+        clearProgress(scope);
+        const feed = document.getElementById('jobFeed');
+        if (feed) {
+          feed.textContent = '质量核验没有提交成功';
+          feed.title = cleanUiText(requestErrorMessage(error));
+        }
       }
     }
     async function cleanup(apply) { const scope=currentScope(); const token=currentViewToken(); if (scopeHasRunningEvidenceJob(scope)) { pushActivityMessage('已有证据任务在后台运行，本次体检不重复提交；中间对话仍可继续使用。', '任务 · 继续等待', scope); renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]}); return; } setBusy(true); setAwaitingJobStart(scope, true); startProgress(scope, 'cleanup', apply ? '清理证据上下文' : '检查证据上下文'); pushThinking(apply ? '正在清理证据上下文' : '正在检查证据上下文', scope); renderChatIfCurrent(token, scope, (window.lastData || {}).chat || {active:chatActive, messages:[]}); try { const res = await postJson('/api/cleanup', {apply, ui_scope:scope}); if (!viewStillCurrent(token, scope)) { mergeJobIntoLastData(res && res.job); setAwaitingJobStart(scope, false); scheduleRefresh(700); return; } if (res && res.deduped) { handleDedupedJob(scope, res.job, apply ? '当前范围已有证据清理任务在运行，本次没有重复提交。' : '当前范围已有证据体检任务在运行，本次没有重复提交。'); await refreshIfCurrent(token, scope); return; } mergeJobIntoLastData(res && res.job); pushActivityMessage(apply ? '任务已提交：正在清理不合格证据上下文。' : '任务已提交：正在检查证据上下文完整性。', '任务 · 已开始', scope); setAwaitingJobStart(scope, false); renderLiveProgress(scope); await refreshIfCurrent(token, scope); } catch (error) { handleUiFailureIfCurrent(token, scope, apply ? '证据清理任务' : '证据体检任务', error); } }
@@ -4323,6 +4939,9 @@ def render_index_html() -> str:
     function num(id) { return Number(val(id)); }
     function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
     function cleanUiText(text) {
+      let cleanedText = String(text ?? '')
+        .replace(/Remote request failed with HTTP 429:[^\n]+/gi, '远程源限流或预算不足，已降级使用本地证据。')
+        .replace(/\{[^\n{}]*(Too Many Requests|Insufficient budget|Rate limit exceeded)[^\n{}]*\}/gi, '远程源限流或预算不足，已降级使用本地证据。');
       const candidateWord = '\u5019\u9009';
       const bestOralCandidate = 'Best / Nominee / Oral ' + candidateWord;
       const frontierCandidate = 'frontier ' + candidateWord;
@@ -4343,7 +4962,7 @@ def render_index_html() -> str:
       const candidateDossiers = 'Candidate' + ' Dossiers';
       const candidateOutside = 'Candidate' + ' ideas outside current Gold context';
       const candidateGeneric = 'Candidate';
-      return String(text ?? '')
+      return cleanedText
         .split(bestOralCandidate).join('Best / Nominee / Oral 线索')
         .split(frontierCandidate).join('frontier 线索')
         .split(recentCandidateOpenAlex).join('OpenAlex 趋势')
@@ -4492,7 +5111,7 @@ def render_index_html() -> str:
     function renderOptionControls(data) {
       if (appOptions) return;
       appOptions = data.options || {};
-      selectedVenues = new Set(appOptions.default_gold_venues || ['ICLR','NeurIPS','ICML','CVPR','ICCV','TPAMI']);
+      selectedVenues = new Set(appOptions.default_gold_venues || ['ICLR','NeurIPS','ICML','CVPR','ICCV']);
       selectedVenueGroup = ((appOptions.venue_groups || [])[0] || {}).id || 'core';
       document.getElementById('fromYear').value = appOptions.default_from_year || 2024;
       document.getElementById('toYear').value = appOptions.default_to_year || 2026;
@@ -4574,21 +5193,7 @@ def render_index_html() -> str:
     function ideateSummaryText(summary) {
       if (!summary || typeof summary !== 'object') return '';
       if (summary.type === 'idea_generation_not_ready' && summary.failure) {
-        const failure = summary.failure;
-        const reasonLabels = {
-          storyline_migration_failed: '生成结果像是在硬搬源论文方法，还没有完成“论文故事线 → 当前领域”的迁移。',
-          prior_art_too_close: '生成结果和已有工作过近，需要先拉开差异边界。',
-          frontier_evidence_not_ready: '当前方向的近期趋势证据不足，需要先补与问题匹配的 frontier 论文。',
-          gold_evidence_not_ready: '核心优秀论文、Genome 或 Pattern 依据不足，五个评分维度还没有显式支撑。',
-          user_library_used_as_standard: '模型把用户论文库当成了 Gold/故事线评分依据；用户库只能作为领域知识和路线学习背景。',
-          idea_generation_not_ready: '严格证据门没有放行这批 idea。'
-        };
-        const lines = ['这次没有写入新对话，因为严格生成门没有放行 idea。'];
-        const primary = failure.primary_reason || 'idea_generation_not_ready';
-        lines.push(reasonLabels[primary] || reasonLabels.idea_generation_not_ready);
-        if (failure.next_action) lines.push(`下一步：${failure.next_action}`);
-        lines.push(...ideaFailureRecoveryLines(failure));
-        return lines.join('\n\n');
+        return '';
       }
       const data = summary.idea_session || {};
       const ideateTypes = new Set(['idea_session_created', 'idea_session_review_ready', 'idea_session_review_incomplete']);
@@ -4633,25 +5238,7 @@ def render_index_html() -> str:
         return lines.join('\n\n');
       }
       if (summary.type !== 'session_step_completed') return '';
-      const lines = ['本轮追问已写入当前会话，并刷新了会话记忆和 dossier。'];
-      if (summary.decision) lines.push(`决策：${summary.decision}`);
-      if (summary.revised_idea) lines.push(`修改后的 idea：${summary.revised_idea}`);
-      if (summary.current_best && summary.current_best !== summary.revised_idea) lines.push(`当前最佳版本：${summary.current_best}`);
-      if (summary.trend_alignment) lines.push(`趋势对齐：${summary.trend_alignment}`);
-      if (summary.memory) {
-        const memory = summary.memory;
-        const memoryBits = [];
-        if (memory.turn_count !== undefined) memoryBits.push(`轮数 ${memory.turn_count}`);
-        if (memory.preferred_language) memoryBits.push(`语言 ${memory.preferred_language}`);
-        if (memoryBits.length) lines.push(`记忆状态：${memoryBits.join(' · ')}`);
-        if (memory.state_policy) lines.push('记忆策略：压缩摘要保持多轮连续性，原始中间过程不进入回答。');
-        if (memory.user_library_policy) lines.push('用户库边界：只作领域背景，不作为评分标准或故事线来源。');
-        if (memory.stable_thesis) lines.push(`稳定主线：${memory.stable_thesis}`);
-        if (memory.unresolved_risk) lines.push(`未解决风险：${memory.unresolved_risk}`);
-        if (memory.next_experiment) lines.push(`下一步实验：${memory.next_experiment}`);
-      }
-      if (summary.dossier) lines.push(`Dossier：${summary.dossier}`);
-      return lines.join('\n');
+      return summary.revised_idea || summary.current_best || '已写入当前对话。';
     }
     function reviewSummaryText(summary) {
       if (!summary || typeof summary !== 'object') return '';
@@ -4670,10 +5257,8 @@ def render_index_html() -> str:
         return lines.join('\n\n');
       }
       if (summary.type !== 'review_completed') return '';
-      const lines = ['审稿人视角已完成：已从 novelty、证据链、逻辑和可行性角度攻击当前 idea。'];
-      if (summary.decision) lines.push(`审稿结论：${summary.decision}`);
-      if (summary.summary) lines.push(`攻击摘要：${summary.summary}`);
-      if (summary.review_path) lines.push(`审稿记录：${summary.review_path}`);
+      const lines = ['审稿意见：' + (summary.summary || '当前 idea 已完成一次顶会审稿视角检查。')];
+      if (summary.decision) lines.push(`结论：${summary.decision}`);
       return lines.join('\n');
     }
     function reviewLoopSummaryText(summary) {
@@ -4697,9 +5282,8 @@ def render_index_html() -> str:
       }
       if (summary.type !== 'review_loop_completed') return '';
       const data = summary.review_loop || {};
-      const lines = [`审稿循环已完成：经过 ${data.rounds_completed || 0}/${data.requested_rounds || 0} 轮审稿专家攻击和改写。`];
+      const lines = [`循环审稿完成：${data.rounds_completed || 0}/${data.requested_rounds || 0} 轮。`];
       if (data.final_idea) lines.push(`最终 idea：${data.final_idea}`);
-      lines.push('中间审稿意见已进入会话记忆；对话区只保留最终结果。');
       return lines.join('\n');
     }
     function sessionStepJobText(result, displayResult) {
@@ -4817,24 +5401,7 @@ def render_index_html() -> str:
       const summary = parseJsonLine(result, 'Idea-session summary JSON');
       const failure = parseJsonLine(result, 'Idea-generation failure JSON');
       if (failure && failure.status === 'idea_generation_not_ready') {
-        const reasonLabels = {
-          storyline_migration_failed: '生成结果像是在硬搬源论文方法，还没有完成“论文故事线 → 当前领域”的迁移。',
-          prior_art_too_close: '生成结果和已有工作过近，需要先拉开差异边界。',
-          frontier_evidence_not_ready: '当前方向的近期趋势证据不足，需要先补与问题匹配的 frontier 论文。',
-          gold_evidence_not_ready: '核心优秀论文、Genome 或 Pattern 依据不足，五个评分维度还没有显式支撑。',
-          user_library_used_as_standard: '模型把用户论文库当成了 Gold/故事线评分依据；用户库只能作为领域知识和路线学习背景。',
-          idea_generation_not_ready: '严格证据门没有放行这批 idea。'
-        };
-        const primary = failure.primary_reason || 'idea_generation_not_ready';
-        const lines = ['这次没有写入新对话，因为严格生成门没有放行 idea。'];
-        lines.push(reasonLabels[primary] || reasonLabels.idea_generation_not_ready);
-        if (failure.next_action) lines.push(`下一步：${failure.next_action}`);
-        lines.push(...ideaFailureRecoveryLines(failure));
-        if (Array.isArray(failure.rejected_ideas) && failure.rejected_ideas.length) {
-          const rejected = failure.rejected_ideas.slice(0, 3).map(item => `${item.title || 'idea'}：${compact(cleanUiText(item.reason || ''), 180)}`).join('\n');
-          lines.push(`被拒摘要：\n${rejected}`);
-        }
-        return lines.join('\n\n');
+        return '';
       }
       const name = firstLineMatch(result, /Name:\s*([^\n]+)/i);
       const currentIdea = firstLineMatch(result, /Current idea:\s*([^\n]+)/i);
@@ -4933,6 +5500,10 @@ def render_index_html() -> str:
       if (sourcePriority.length) {
         lines.push(`来源优先级：\n${sourcePriority.slice(0, 4).join('\n')}`);
       }
+      const fullText = summary.full_text && typeof summary.full_text === 'object' ? summary.full_text : null;
+      if (fullText) {
+        lines.push(`全文证据：更新 ${fullText.updated ?? 0} 篇，已具备 ${fullText.skipped ?? 0} 篇，失败 ${fullText.failed ?? 0} 篇。`);
+      }
       const failures = Array.isArray(summary.source_failures) ? summary.source_failures : [];
       if (failures.length) {
         const failureText = failures.slice(0, 3).map(item => {
@@ -5005,6 +5576,25 @@ def render_index_html() -> str:
         next_actions: summaries.flatMap(item => Array.isArray(item.next_actions) ? item.next_actions : []),
         group_jobs: groupJobs.length
       };
+    }
+    function latestCompletedGoldBuildGroup(jobs) {
+      const finishedGoldJobs = (jobs || []).filter(item => item && item.kind === 'gold-build' && item.status !== 'running' && item.group_id);
+      const groupMap = new Map();
+      for (const job of finishedGoldJobs) {
+        const key = job.group_id || '';
+        if (!key) continue;
+        if (!groupMap.has(key)) groupMap.set(key, []);
+        groupMap.get(key).push(job);
+      }
+      let latest = null;
+      for (const groupJobs of groupMap.values()) {
+        if (groupJobs.length <= 1 || groupJobs.some(item => item.status === 'running')) continue;
+        const timestamp = Math.max(...groupJobs.map(item => jobTsMs(item, 'completed_at') || jobTsMs(item, 'updated_at') || jobTsMs(item, 'created_at') || 0));
+        if (!latest || timestamp > latest.timestamp) {
+          latest = {timestamp, jobs:groupJobs};
+        }
+      }
+      return latest ? latest.jobs : null;
     }
     function goldBuildGroupJobText(groupJobs) {
       const summary = summarizeGoldBuildGroup(groupJobs);
@@ -5144,12 +5734,13 @@ def render_index_html() -> str:
     function renderChat(chat) {
       const el=document.getElementById('chatMessages');
       const wasNearBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 80);
-      const active = chat && chat.active && chat.session && !newChatMode;
+      const active = Boolean(chat && chat.active && chat.session && !newChatMode);
+      const lockedToExistingSession = Boolean(activeSessionId && !newChatMode);
       chatActive = Boolean(active);
       if (active && !activeSessionId) activeSessionId = Number(chat.session.id);
       const scope = active && chat.session ? `session:${Number(chat.session.id)}` : currentScope();
-      if (!isBusy) document.getElementById('sendButton').textContent = active ? '发送' : '生成';
-      document.getElementById('instruction').placeholder = active ? '继续追问或修改当前 idea' : '说一个研究领域、问题或粗略方向';
+      if (!isBusy) document.getElementById('sendButton').textContent = lockedToExistingSession ? '发送' : '生成';
+      document.getElementById('instruction').placeholder = lockedToExistingSession ? '继续追问或修改当前 idea' : '说一个研究领域、问题或粗略方向';
       const serverMessages = active ? ((chat && chat.messages) || []) : (chat && chat.draft ? (chat.messages || []) : [{role:'assistant', kind:'draft', meta:'new workspace', text:'已准备好新对话。直接输入你想研究的方向，我会从论文逻辑库和近期证据里生成新 idea。'}]);
       const transientMessages = scopeMessages(transientMessagesByScope, scope);
       const adoptedUserMessages = active ? transientMessages.filter(m => m.adoptedFromDraft && !m.thinking) : [];
@@ -5199,6 +5790,11 @@ def render_index_html() -> str:
           }
           if (job.kind === 'ideate' && job.created_session_id) {
             lastJobStatuses.set(job.id, job.status);
+            continue;
+          }
+          if (isConversationBlockingJob(job)) {
+            lastJobStatuses.set(job.id, job.status);
+            setScopeMessages(transientMessagesByScope, jobScope, scopeMessages(transientMessagesByScope, jobScope).filter(m => !m.thinking));
             continue;
           }
           const activity = jobActivity(job);
@@ -5295,6 +5891,7 @@ def render_index_html() -> str:
         node.className = `library-panel ${collapsed ? 'collapsed' : ''}`;
         node.innerHTML = `<button id="${esc(id)}" class="library-toggle" onclick="toggleLibraryPanel('${esc(id)}')" aria-expanded="${collapsed ? 'false' : 'true'}"><h2>${esc(label)}</h2><span class="section-right"><span class="pill">${esc(count)}</span><span class="library-toggle-icon">${esc(icon)}</span></span></button><div class="library-body">${body}</div>`;
       };
+      syncEvidenceBuildPanelState();
       renderUserLibraryPanel(userPapers);
       renderUserLibraryMainPanel(userPapers);
       const papersBody = (excellent.length ? `<div class="paper-list">${excellent.map(p=>renderPaperRow(p, 'excellent')).join('')}</div>` : emptyAction('还没有可进入生成/评分标准的核心优秀论文。点击去扩充核心优秀论文库。', 'settings', '打开检索设置')) + `<button id="frontierPanel" class="section-link" onclick="metricAction('frontier')" title="查看趋势论文分区"><h2>趋势论文</h2><span class="section-right"><span class="pill">${esc(frontier.length)}</span></span></button>` + (frontier.length ? `<div class="paper-list">${frontier.map(p=>renderPaperRow(p, 'frontier')).join('')}</div>` : emptyAction('联网检索到但未通过核心优秀论文标准的论文会显示在这里。点击回到对话生成 idea 或补充证据。', 'chat', '回到对话'));
@@ -5317,8 +5914,22 @@ def render_index_html() -> str:
       node.innerHTML = `<span class="user-library-tab-label">用户论文库 <span class="pill">${esc(userPapers.length)}</span></span><span class="user-library-tab-arrow">›</span>`;
     }
     function toggleLibraryPanel(id) {
+      if (id === 'evidenceBuildPanel') {
+        libraryCollapsed[id] = !libraryCollapsed[id];
+        syncEvidenceBuildPanelState();
+        return;
+      }
       libraryCollapsed[id] = !libraryCollapsed[id];
       renderLibrary(window.lastData || {});
+    }
+    function syncEvidenceBuildPanelState() {
+      const panel = document.getElementById('evidenceBuildPanel');
+      const toggle = document.getElementById('evidenceBuildPanelToggle');
+      const icon = toggle ? toggle.querySelector('.library-toggle-icon') : null;
+      const collapsed = Boolean(libraryCollapsed.evidenceBuildPanel);
+      if (panel) panel.classList.toggle('collapsed', collapsed);
+      if (toggle) toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      if (icon) icon.textContent = collapsed ? '+' : '−';
     }
     function evidenceFailureHint(job) {
       const summary = job && job.failure_summary && typeof job.failure_summary === 'object' ? job.failure_summary : null;
@@ -5341,25 +5952,77 @@ def render_index_html() -> str:
       };
       return labels[status] || (ready ? labels.ready : labels.needs_evidence);
     }
+    function evidenceCompletionSummary(job, jobs=[]) {
+      if (!job) return '';
+      if (job.kind === 'gold-build') {
+        const groupJobs = completedGoldBuildGroupForJob(job, jobs);
+        const summary = groupJobs ? summarizeGoldBuildGroup(groupJobs) : parseGoldBuildSummary(job.result ? `${job.result.stdout || ''}${job.result.stderr || ''}`.trim() : job.error);
+        if (summary) return `Gold ${summary.excellent_imported ?? 0} · 趋势 ${summary.candidate_imported ?? 0} · 失败 ${summary.failures ?? 0}`;
+      }
+      if (job.kind === 'quality-enrich') {
+        const result = job.result ? `${job.result.stdout || ''}${job.result.stderr || ''}`.trim() : job.error;
+        const applied = firstLineMatch(result, /Applied labels:\s*(\d+)/i);
+        const skipped = firstLineMatch(result, /Skipped labels:\s*(\d+)/i);
+        if (applied || skipped) return `新增标签 ${applied || 0} · 跳过 ${skipped || 0}`;
+      }
+      if (job.kind === 'cleanup') {
+        const result = job.result ? `${job.result.stdout || ''}${job.result.stderr || ''}`.trim() : job.error;
+        const legacy = firstLineMatch(result, /Legacy non-core Gold paper records:\s*(\d+)/i);
+        const genomes = firstLineMatch(result, /Non-Gold genome cards:\s*(\d+)/i);
+        const patterns = firstLineMatch(result, /Non-Gold strict pattern cards:\s*(\d+)/i);
+        const bits = [];
+        if (legacy) bits.push(`旧 Gold ${legacy}`);
+        if (genomes) bits.push(`Genome ${genomes}`);
+        if (patterns) bits.push(`Pattern ${patterns}`);
+        if (bits.length) return bits.join(' · ');
+      }
+      return '';
+    }
     function renderJobs(data) {
       const jobs=data.jobs || [];
       document.getElementById('jobCount').textContent = jobs.length;
       const runningJobs = jobs.filter(j => j.status === 'running');
       const running = runningJobs[0];
       const health = data.health || {};
-      const failedEvidence = health.latest_failed_evidence_job || jobs.find(j => j.status === 'failed' && ['gold-build', 'quality-enrich', 'cleanup'].includes(j.kind));
+      const evidenceKinds = ['gold-build', 'quality-enrich', 'cleanup'];
+      const finishedEvidenceJobs = jobs.filter(j => j.status !== 'running' && evidenceKinds.includes(j.kind)).sort((a, b) => jobTsMs(b, 'completed_at') - jobTsMs(a, 'completed_at') || jobTsMs(b, 'updated_at') - jobTsMs(a, 'updated_at') || jobTsMs(b, 'created_at') - jobTsMs(a, 'created_at'));
+      const latestGoldGroup = latestCompletedGoldBuildGroup(jobs);
+      const latestGoldGroupTs = latestGoldGroup ? Math.max(...latestGoldGroup.map(item => jobTsMs(item, 'completed_at') || jobTsMs(item, 'updated_at') || jobTsMs(item, 'created_at') || 0)) : 0;
+      const latestFinishedEvidence = finishedEvidenceJobs[0] || null;
+      const latestFinishedTs = latestFinishedEvidence ? (jobTsMs(latestFinishedEvidence, 'completed_at') || jobTsMs(latestFinishedEvidence, 'updated_at') || jobTsMs(latestFinishedEvidence, 'created_at') || 0) : 0;
+      const latestCompletedEvidence = latestFinishedEvidence && latestFinishedEvidence.status === 'completed' ? latestFinishedEvidence : null;
+      const latestGroupIsCurrent = latestGoldGroup && latestGoldGroupTs >= latestFinishedTs;
+      const failedEvidence = !latestGroupIsCurrent && latestFinishedEvidence && latestFinishedEvidence.status === 'failed' ? latestFinishedEvidence : null;
       const el = document.getElementById('jobFeed');
       el.className = `status-mini status-link ${running ? 'running' : ''}`;
-      el.onclick = () => metricAction('chat');
-      el.textContent = running ? `正在运行 ${runningJobs.length} 个任务` : '空闲';
-      if (!running && failedEvidence) {
-        const action = failedEvidence.kind === 'quality-enrich' ? 'quality-enrich' : 'settings';
+      el.onclick = () => metricAction(running && !isConversationBlockingJob(running) ? 'runs' : 'chat');
+      const awaitingEvidence = scopeAwaitingJobStart(evidenceScope());
+      el.textContent = awaitingEvidence ? '证据任务提交中' : (running ? `正在运行 ${runningJobs.length} 个任务` : '空闲');
+      if (!running && !awaitingEvidence && latestGroupIsCurrent) {
+        const summary = summarizeGoldBuildGroup(latestGoldGroup);
+        const partial = Number(summary.failures || 0) > 0;
+        el.onclick = () => metricAction(Number(summary.excellent_imported || 0) > 0 ? 'excellent' : 'frontier');
+        el.textContent = `${partial ? '部分完成' : '最近完成'}：核心库扩充：Gold ${summary.excellent_imported ?? 0} · 趋势 ${summary.candidate_imported ?? 0} · 失败 ${summary.failures ?? 0}。点击查看。`;
+        el.title = partial ? '部分来源失败，但成功来源已写入证据库；可查看核心库/趋势区或调整检索。' : '证据任务已结束；对话区不显示中间输出，结果可在证据库或运行记录查看。';
+      } else if (!running && failedEvidence) {
+        const action = failedEvidence.kind === 'quality-enrich' ? 'quality-enrich' : 'evidence-build';
         el.onclick = () => metricAction(action);
         const hint = evidenceFailureHint(failedEvidence);
         el.textContent = failedEvidence.kind === 'quality-enrich' ? `最近失败：${displayJobName(failedEvidence)}。点击重新核验。` : `最近失败：${displayJobName(failedEvidence)}。点击调整检索。`;
         el.title = hint;
+      } else if (!running && !awaitingEvidence && latestCompletedEvidence) {
+        const completedLabels = {
+          'gold-build': ['最近完成：核心库扩充', 'excellent'],
+          'quality-enrich': ['最近完成：趋势质量核验', 'frontier'],
+          'cleanup': ['最近完成：证据体检', 'runs'],
+        };
+        const [label, action] = completedLabels[latestCompletedEvidence.kind] || ['最近完成：证据任务', 'runs'];
+        const summary = evidenceCompletionSummary(latestCompletedEvidence, jobs);
+        el.onclick = () => metricAction(action);
+        el.textContent = `${label}${summary ? `：${summary}` : ''}。点击查看。`;
+        el.title = '证据任务已结束；对话区不显示中间输出，结果可在证据库或运行记录查看。';
       } else {
-        el.title = running ? '任务结果只会出现在中间对话' : '任务结果只会出现在中间对话';
+        el.title = running ? '证据任务只显示简短状态；对话任务完成后只保留最终回答' : '证据任务只显示简短状态，结果进入证据库';
       }
     }
     function metricAction(action) {
@@ -5369,10 +6032,12 @@ def render_index_html() -> str:
       if (action === 'frontier') { libraryCollapsed.excellentPanel = false; showLibrary(); renderLibrary(window.lastData || {}); scrollLibraryTo('frontierPanel'); }
       if (action === 'patterns') { libraryCollapsed.patternsPanel = false; showLibrary(); renderLibrary(window.lastData || {}); scrollLibraryTo('patternsPanel'); }
       if (action === 'runs') { libraryCollapsed.runsPanel = false; showLibrary(); renderLibrary(window.lastData || {}); scrollLibraryTo('runsPanel'); }
+      if (action === 'evidence-build') { libraryCollapsed.evidenceBuildPanel = false; showLibrary(); renderLibrary(window.lastData || {}); scrollLibraryTo('evidenceBuildPanel'); }
       if (action === 'chat') showChat();
       if (action === 'quality-enrich') qualityEnrich();
       if (action === 'review') review();
-      if (action === 'settings') { showChat(); const target=document.getElementById('searchSettings'); if (target) { target.open=true; target.scrollIntoView({block:'start', behavior:'smooth'}); } }
+      if (action === 'settings') metricAction('evidence-build');
+      if (action === 'model-settings') { showChat(); const target=document.getElementById('searchSettings'); if (target) { target.open=true; target.scrollIntoView({block:'start', behavior:'smooth'}); } }
     }
     function messageAction(action) { metricAction(action); }
     function scrollLibraryTo(id) {
@@ -5458,7 +6123,7 @@ def render_index_html() -> str:
       const missing = Array.isArray(health.missing_requirements) ? health.missing_requirements.map(item => `${item.key}:${item.current}/${item.required}`).join(' · ') : '';
       document.getElementById('strictStatus').textContent = statusText;
       document.getElementById('strictStatus').title = failedEvidence ? `最近失败：${displayJobName(failedEvidence)} · ${evidenceFailureHint(failedEvidence)}` : (missing ? `证据缺口：${missing}` : '查看核心优秀论文库');
-      document.getElementById('strictStatus').onclick = () => metricAction(failedEvidence ? 'settings' : 'excellent');
+      document.getElementById('strictStatus').onclick = () => metricAction(failedEvidence ? 'evidence-build' : 'excellent');
       document.getElementById('strictStatus').className = `status-pill ${ready ? 'ok' : 'bad'}`;
       const healthDot = document.getElementById('healthDot');
       if (healthDot) healthDot.className = `health-dot ${health.evidence_status === 'building' ? 'building' : (ready && data.project.api_key_configured ? '' : 'bad')}`;
@@ -5488,3 +6153,7 @@ def render_index_html() -> str:
   </script>
 </body>
 </html>"""
+    return (
+        html.replace("${defaultFromYear}", str(default_gold_from_year()))
+        .replace("${defaultToYear}", str(default_gold_to_year()))
+    )

@@ -26,6 +26,7 @@ from research_alpha.db import (
     count_pattern_cards,
     count_scored_papers,
     create_idea_session,
+    delete_user_library_paper,
     get_candidate_idea,
     get_paper_by_id,
     get_idea_session,
@@ -50,11 +51,14 @@ from research_alpha.db import (
     update_idea_session_memory,
     update_paper_quality_metadata,
     update_paper_limitations,
+    update_paper_full_text,
     upsert_idea_card,
     upsert_pattern_card,
+    upsert_user_library_paper,
 )
+from research_alpha.full_text import FullTextError, extract_section_evidence, fetch_full_text, fetch_full_text_with_metadata, pdf_parser_status, sanitize_full_text_payload
 from research_alpha.genome import GENOME_SYSTEM_PROMPT, build_genome_prompt, parse_genome_response
-from research_alpha.gui import run_gui
+from research_alpha.gui import run_gui, user_library_metadata_from_url, validate_user_library_url
 from research_alpha.ideas import IDEA_SYSTEM_PROMPT, build_idea_prompt, parse_idea_response
 from research_alpha.json_utils import parse_llm_json
 from research_alpha.layout import ensure_layout, scaffold_project_files, write_gitkeep
@@ -201,7 +205,19 @@ def sanitize_failure_for_prompt(value: object) -> object:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
-CORE_GOLD_REMOTE_SOURCES = {"gold_openreview", "gold_icml_awards", "gold_neurips_awards", "gold_cvf_awards"}
+
+
+def parse_json_object(value: object) -> Dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    try:
+        payload = json.loads(str(value or "{}"))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+CORE_GOLD_REMOTE_SOURCES = {"gold_openreview", "gold_icml_awards", "gold_neurips_awards", "gold_cvf_awards", "gold_seed"}
 DEFAULT_ASK_SMOKE_PROMPT = "Reply with one short sentence confirming that this LLM connection is working."
 DEFAULT_AWARD_WEIGHTS = {
     "best_paper": 5.0,
@@ -220,6 +236,28 @@ CORE_GOLD_QUALITY_POLICY = {
     "accepted_quality_signals": ["best_paper", "outstanding_paper/nominee/honorable_mention", "oral"],
     "excluded_from_gold": ["poster", "spotlight", "high_citation_only", "ordinary_accept", "auxiliary_venues"],
 }
+GOLD_EVIDENCE_TIER_POLICY = {
+    "gold_complete_logic": {
+        "signals": ["best_paper", "outstanding_paper", "test_of_time"],
+        "use": "highest_weight_storyline_standard",
+    },
+    "gold_problem_framing": {
+        "signals": ["nominee", "honorable_mention", "outstanding_paper"],
+        "use": "high_weight_problem_framing_standard",
+    },
+    "gold_reviewer_clarity": {
+        "signals": ["oral"],
+        "use": "medium_high_weight_novelty_clarity_standard",
+    },
+    "trend_reference": {
+        "signals": ["spotlight", "high_citation"],
+        "use": "trend_context_only_unless_also_core_gold",
+    },
+    "frontier_context": {
+        "signals": ["poster", "arxiv", "ordinary_accept"],
+        "use": "context_only_never_scoring_standard",
+    },
+}
 GOLD_BUILD_SOURCE_PRIORITY = [
     "Official award pages for ICML/NeurIPS/CVF Best and Outstanding papers",
     "Official ICML/NeurIPS/CVF oral event pages and OpenReview metadata for core Oral papers",
@@ -227,6 +265,7 @@ GOLD_BUILD_SOURCE_PRIORITY = [
 ]
 POSTER_RE = re.compile(r"\bposter(?:s|_paper|_presentation)?\b", re.IGNORECASE)
 EXTRACTIVE_EVIDENCE_LEVEL = "extractive_abstract_only"
+EXTRACTIVE_FULL_TEXT_EVIDENCE_LEVEL = "extractive_full_text_sections"
 EXTRACTIVE_PATTERN_EVIDENCE_LEVEL = "extractive_abstract_only_aggregation"
 TERM_STOPWORDS = {
     "about",
@@ -265,6 +304,18 @@ TERM_STOPWORDS = {
 
 def progress_note(message: str) -> None:
     print(f"进度：{message}", flush=True)
+
+
+def user_facing_remote_failure(error: object) -> str:
+    text = str(error or "").strip()
+    lowered = text.lower()
+    if "429" in lowered or "rate limit" in lowered or "too many requests" in lowered or "insufficient budget" in lowered:
+        return "远程源限流或预算不足，已降级使用本地证据。"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "远程源超时，已降级使用本地证据。"
+    if not text:
+        return "远程源暂不可用，已降级使用本地证据。"
+    return "远程源暂不可用，已降级使用本地证据。"
 
 EVIDENCE_RUBRIC_DIMENSIONS = [
     {
@@ -345,6 +396,9 @@ def build_session_context_from_candidate(payload: Dict[str, object], candidate_i
         "first_experiments": [str(item).strip() for item in first_experiments if str(item).strip()],
         "paper_angle": str(payload.get("paper_angle", "")).strip(),
         "storyline_trace": storyline_trace,
+        "idea_evaluation_protocol": payload.get("idea_evaluation_protocol", {})
+        if isinstance(payload.get("idea_evaluation_protocol"), dict)
+        else {},
         "evidence_basis": normalize_explicit_evidence_basis(payload.get("evidence_basis")),
         "domain_knowledge_context": payload.get("domain_knowledge_context", {})
         if isinstance(payload.get("domain_knowledge_context"), dict)
@@ -358,6 +412,11 @@ def build_session_context_from_candidate(payload: Dict[str, object], candidate_i
         "prior_art_label": str(prior_art.get("overlap_label", "")).strip(),
         "prior_art_summary": str(prior_art.get("summary", "")).strip(),
         "differentiation_note": str(prior_art.get("differentiation_note", "")).strip(),
+        "novelty_boundary": str(prior_art_gate.get("novelty_boundary", prior_art.get("novelty_boundary", ""))).strip(),
+        "renamed_only_risk": str(prior_art_gate.get("renamed_only_risk", prior_art.get("renamed_only_risk", ""))).strip(),
+        "closest_work": prior_art_gate.get("closest_work", [])
+        if isinstance(prior_art_gate.get("closest_work"), list)
+        else [],
         "prior_art_gate_decision": str(prior_art_gate.get("decision", "")).strip(),
         "prior_art_gate_summary": str(prior_art_gate.get("summary", "")).strip(),
         "why_not_done_yet": [
@@ -378,7 +437,7 @@ def build_session_context_from_candidate(payload: Dict[str, object], candidate_i
     }
 
 
-def refresh_session_memory(root_dir: Path, session_id: int) -> Dict[str, object]:
+def refresh_session_memory(root_dir: Path, session_id: int, session_context_override: Dict[str, object] | None = None) -> Dict[str, object]:
     config = load_config(root_dir)
     ensure_layout(config)
     init_db(config.db_path)
@@ -386,7 +445,7 @@ def refresh_session_memory(root_dir: Path, session_id: int) -> Dict[str, object]
     if not session:
         raise ValueError(f"Idea session not found: {session_id}")
     turns = list_idea_session_turns(config.db_path, session_id)
-    session_context = load_session_context(session)
+    session_context = session_context_override if isinstance(session_context_override, dict) else load_session_context(session)
     memory = build_session_memory_summary(session, turns, session_context)
     update_idea_session_memory(
         config.db_path,
@@ -463,6 +522,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("init", help="Create the local project layout and SQLite database.")
     subparsers.add_parser("status", help="Show project, database, and LLM configuration status.")
+    doctor_parser = subparsers.add_parser("doctor", aliases=["doc"], help="Summarize local readiness for LLM, evidence, full text, and user library.")
+    doctor_parser.add_argument("--papers", default=12, type=int, help="How many core Gold papers to include in evidence readiness checks.")
+    doctor_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
 
     gui_parser = subparsers.add_parser("gui", help="Start the local Research Alpha GUI.")
     gui_parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
@@ -507,6 +569,20 @@ def build_parser() -> argparse.ArgumentParser:
     papers_parser = subparsers.add_parser("papers", help="List recently added paper records.")
     papers_parser.add_argument("--limit", default=10, type=int, help="Maximum number of rows to print.")
 
+    user_library_parser = subparsers.add_parser(
+        "user-library",
+        aliases=["ul"],
+        help="List user-library papers and whether they have domain-knowledge full-text hints.",
+    )
+    user_library_parser.add_argument("action", nargs="?", choices=["list", "add", "delete"], default="list", help="Action to run. Defaults to list.")
+    user_library_parser.add_argument("value", nargs="?", help="URL for add, or paper id for delete.")
+    user_library_parser.add_argument("--url", default="", help="Paper URL for `user-library add`.")
+    user_library_parser.add_argument("--paper-id", type=int, help="Paper id for `user-library delete`.")
+    user_library_parser.add_argument("--title", default="", help="Optional title override for add.")
+    user_library_parser.add_argument("--note", default="", help="Optional route/domain note for add.")
+    user_library_parser.add_argument("--limit", default=20, type=int, help="Maximum number of rows to print.")
+    user_library_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+
     harvest_parser = subparsers.add_parser(
         "harvest",
         aliases=["grab", "ingest", "h"],
@@ -520,6 +596,17 @@ def build_parser() -> argparse.ArgumentParser:
     harvest_parser.add_argument("--limit", default=20, type=int, help="Maximum number of remote results to import.")
     harvest_parser.add_argument("--source", default="seed", help="Source label stored with the imported papers.")
 
+    gold_seed_parser = subparsers.add_parser(
+        "gold-seed",
+        help="Import locally verified Gold paper seeds without using them as user-library/domain papers.",
+    )
+    gold_seed_parser.add_argument("--file", default="seeds/gold_papers.jsonl", help="Path to a local Gold seed JSONL, JSON, or CSV file.")
+    gold_seed_parser.add_argument("--limit", default=50, type=int, help="Maximum seed records to import.")
+    gold_seed_parser.add_argument("--fulltext", action="store_true", help="Fetch full-text evidence for imported/scored Gold papers after import.")
+    gold_seed_parser.add_argument("--extractive-genomes", action="store_true", help="Build extractive Genome drafts after import.")
+    gold_seed_parser.add_argument("--timeout", type=int, default=60, help="Per-paper full-text fetch timeout in seconds.")
+    gold_seed_parser.add_argument("--max-bytes", type=int, default=5_000_000, help="Maximum bytes to download per paper.")
+
     gold_parser = subparsers.add_parser(
         "gold-build",
         aliases=["gold"],
@@ -532,6 +619,7 @@ def build_parser() -> argparse.ArgumentParser:
     gold_parser.add_argument("--to-year", type=int, default=2026, help="Last publication year to harvest.")
     gold_parser.add_argument("--per-venue-year", type=int, default=8, help="Maximum remote records per venue-year before strict quality filtering.")
     gold_parser.add_argument("--extractive-genomes", action="store_true", help="Also build abstract-only Genome drafts for newly scored excellent papers.")
+    gold_parser.add_argument("--no-fulltext", action="store_true", help="Skip automatic full-text enrichment after strict Gold import.")
 
     subparsers.add_parser("score", aliases=["rank", "s"], help="Compute paper weights from awards and citation signals.")
 
@@ -553,6 +641,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     limitations_parser.add_argument("--months", type=int, default=6, help="Recent window in months.")
     limitations_parser.add_argument("--limit", type=int, default=12, help="Maximum papers to include.")
+
+    fulltext_parser = subparsers.add_parser(
+        "fulltext",
+        aliases=["ft"],
+        help="Fetch and extract introduction/limitations/experiment/conclusion snippets for stored papers.",
+    )
+    fulltext_parser.add_argument("--paper-id", type=int, help="Specific paper ID to process.")
+    fulltext_parser.add_argument("--user-library", action="store_true", help="Process user-library papers as domain-knowledge full text.")
+    fulltext_parser.add_argument("--limit", type=int, default=5, help="Maximum top papers to process when --paper-id is omitted.")
+    fulltext_parser.add_argument("--timeout", type=int, default=60, help="Per-paper fetch timeout in seconds.")
+    fulltext_parser.add_argument("--max-bytes", type=int, default=5_000_000, help="Maximum bytes to download per paper.")
 
     quality_enrich_parser = subparsers.add_parser(
         "quality-enrich",
@@ -617,6 +716,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--extractive",
         action="store_true",
         help="Build cards only from stored title/abstract/quality metadata, without an LLM.",
+    )
+    genome_build_parser.add_argument(
+        "--refresh-stale",
+        action="store_true",
+        help="Rebuild existing shallow Genome cards when their paper now has paper-like full-text evidence.",
+    )
+    genome_build_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show candidate papers for batch/stale Genome generation without writing cards or calling an LLM.",
     )
 
     genomes_parser = subparsers.add_parser(
@@ -876,6 +985,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_init(config.root_dir)
     if args.command == "status":
         return cmd_status(config.root_dir)
+    if args.command in {"doctor", "doc"}:
+        return cmd_doctor(config.root_dir, paper_limit=args.papers, json_output=args.json)
     if args.command == "gui":
         return run_gui(config.root_dir, host=args.host, port=args.port, open_browser=not args.no_open)
     if args.command in {"llm", "lm"}:
@@ -895,6 +1006,18 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_add_paper(config.root_dir, args.title, args.venue, args.year, args.abstract)
     if args.command == "papers":
         return cmd_list_papers(config.root_dir, args.limit)
+    if args.command in {"user-library", "ul"}:
+        return cmd_user_library(
+            config.root_dir,
+            action=args.action,
+            value=args.value,
+            url=args.url,
+            paper_id=args.paper_id,
+            title=args.title,
+            note=args.note,
+            limit=args.limit,
+            json_output=args.json,
+        )
     if args.command in {"harvest", "grab", "ingest", "h"}:
         return cmd_harvest(
             config.root_dir,
@@ -906,6 +1029,16 @@ def main(argv: list[str] | None = None) -> int:
             year=args.year,
             limit=args.limit,
         )
+    if args.command == "gold-seed":
+        return cmd_gold_seed(
+            config.root_dir,
+            file_path=args.file,
+            limit=args.limit,
+            fetch_full_text_after=args.fulltext,
+            extractive_genomes=args.extractive_genomes,
+            timeout=args.timeout,
+            max_bytes=args.max_bytes,
+        )
     if args.command in {"gold-build", "gold"}:
         return cmd_gold_build(
             config.root_dir,
@@ -916,6 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
             to_year=args.to_year,
             per_venue_year=args.per_venue_year,
             extractive_genomes=args.extractive_genomes,
+            fetch_full_text_after=not args.no_fulltext,
         )
     if args.command in {"score", "rank", "s"}:
         return cmd_score(config.root_dir)
@@ -925,6 +1059,15 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_trends(config.root_dir, args.years, args.top_k)
     if args.command in {"limitations", "lim"}:
         return cmd_limitations(config.root_dir, args.months, args.limit)
+    if args.command in {"fulltext", "ft"}:
+        return cmd_fulltext(
+            config.root_dir,
+            paper_id=args.paper_id,
+            user_library=args.user_library,
+            limit=args.limit,
+            timeout=args.timeout,
+            max_bytes=args.max_bytes,
+        )
     if args.command in {"quality-enrich", "qe"}:
         return cmd_quality_enrich(
             config.root_dir,
@@ -942,7 +1085,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in {"genome", "g"}:
         return cmd_genome(config.root_dir, args.paper_id, args.provider, args.model, args.extractive)
     if args.command in {"genome-build", "gb"}:
-        return cmd_genome_build(config.root_dir, args.limit, args.provider, args.model, args.all, args.extractive)
+        return cmd_genome_build(config.root_dir, args.limit, args.provider, args.model, args.all, args.extractive, args.refresh_stale, args.dry_run)
     if args.command in {"genomes", "gs"}:
         return cmd_list_genomes(config.root_dir, args.limit)
     if args.command in {"pattern-build", "pb"}:
@@ -1140,6 +1283,155 @@ def cmd_status(root_dir: Path) -> int:
     return 0
 
 
+def cmd_doctor(root_dir: Path, *, paper_limit: int = 12, json_output: bool = False) -> int:
+    payload = build_doctor_payload(root_dir, paper_limit=max(1, int(paper_limit)))
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+    print_doctor_payload(payload)
+    return 0 if payload["overall_status"] in {"ready", "usable"} else 1
+
+
+def build_doctor_payload(root_dir: Path, *, paper_limit: int) -> Dict[str, object]:
+    config = load_config(root_dir)
+    ensure_layout(config)
+    init_db(config.db_path)
+    evidence_payload, _, _ = build_evidence_report(config.root_dir, paper_limit=max(1, int(paper_limit)))
+    evidence_counts = evidence_payload.get("counts", {})
+    if not isinstance(evidence_counts, dict):
+        evidence_counts = {}
+    user_library = build_user_library_cli_payload(config.db_path, limit=50)
+    llm_summary = provider_summary(config.llm)
+    runtime_summary = {
+        "pdf_parser": pdf_parser_status(),
+    }
+    counts = {table: count for table, count in table_counts(config.db_path, TABLES)}
+    issues: List[Dict[str, str]] = []
+    next_commands: List[str] = []
+    if not bool(llm_summary.get("api_key_configured")):
+        provider = str(llm_summary.get("provider", "openai"))
+        issues.append({"code": "missing_llm_api_key", "severity": "warning", "message": f"LLM provider {provider} has no API key configured."})
+        next_commands.append(f"{CLI_CMD} llm ds sk-...")
+    if evidence_payload.get("status") != "ready_for_strict_generation":
+        issues.append({"code": "evidence_not_ready", "severity": "blocker", "message": str(evidence_payload.get("status", "not_ready"))})
+        for item in evidence_payload.get("missing_requirements", [])[:3] if isinstance(evidence_payload.get("missing_requirements", []), list) else []:
+            issues.append({"code": "missing_evidence_requirement", "severity": "blocker", "message": str(item)})
+        next_commands.append(f"{CLI_CMD} gold --remote openreview --query \"research agents\" --extractive-genomes")
+        next_commands.append(f"{CLI_CMD} gb --limit 5")
+        next_commands.append(f"{CLI_CMD} pb --limit 5")
+    abstract_only = int(evidence_counts.get("abstract_only_papers", 0) or 0)
+    full_text_ready = int(evidence_counts.get("full_text_ready_papers", 0) or 0)
+    metadata_page_sections = int(evidence_counts.get("metadata_page_section_papers", 0) or 0)
+    stale_genome_cards = int(evidence_counts.get("stale_genome_cards", 0) or 0)
+    stale_pattern_cards = int(evidence_counts.get("stale_pattern_cards", 0) or 0)
+    if abstract_only > 0:
+        issues.append({"code": "abstract_only_gold_papers", "severity": "notice", "message": f"{abstract_only} Gold papers still have abstract-only evidence."})
+        next_commands.append(f"{CLI_CMD} fulltext --limit {min(max(1, abstract_only), 20)}")
+    if metadata_page_sections > 0:
+        issues.append({"code": "metadata_page_full_text_hints", "severity": "notice", "message": f"{metadata_page_sections} Gold papers have section hints from short metadata/event pages, not paper-like full text."})
+    if stale_genome_cards > 0:
+        issues.append({"code": "stale_genome_cards", "severity": "notice", "message": f"{stale_genome_cards} Genome cards have evidence levels that no longer match sanitized full-text evidence."})
+        strict_genome_cards = int(evidence_counts.get("strict_genome_cards", 0) or 0)
+        refresh_mode = "" if strict_genome_cards else " --extractive"
+        next_commands.append(f"{CLI_CMD} gb --refresh-stale{refresh_mode} --limit {min(20, stale_genome_cards)}")
+    if stale_pattern_cards > 0:
+        issues.append({"code": "stale_pattern_cards", "severity": "notice", "message": f"{stale_pattern_cards} Pattern cards depend on Genome cards that need evidence refresh."})
+    if int(user_library.get("count", 0) or 0) > 0 and int(user_library.get("full_text_ready_count", 0) or 0) < int(user_library.get("count", 0) or 0):
+        issues.append({"code": "user_library_missing_full_text_hints", "severity": "notice", "message": "Some user-library papers do not yet have full-text domain hints."})
+        next_commands.append(f"{CLI_CMD} fulltext --user-library --limit 20")
+    ready_for_generation = (
+        bool(llm_summary.get("api_key_configured"))
+        and evidence_payload.get("status") == "ready_for_strict_generation"
+    )
+    if ready_for_generation:
+        next_commands.insert(0, f"{CLI_CMD} id \"research agents\" --ideas 5")
+    elif not issues:
+        next_commands.append(f"{CLI_CMD} id \"research agents\" --ideas 5")
+    next_commands.append(f"{CLI_CMD} evidence --papers {max(1, int(paper_limit))}")
+    seen_commands: List[str] = []
+    for command in next_commands:
+        if command not in seen_commands:
+            seen_commands.append(command)
+    blockers = [item for item in issues if item.get("severity") == "blocker"]
+    overall = "ready" if not blockers and bool(llm_summary.get("api_key_configured")) and evidence_payload.get("status") == "ready_for_strict_generation" else "usable"
+    if blockers:
+        overall = "needs_work"
+    if not bool(llm_summary.get("api_key_configured")) and blockers:
+        overall = "needs_setup"
+    return {
+        "overall_status": overall,
+        "llm": {
+            "provider": llm_summary.get("provider"),
+            "model": llm_summary.get("model"),
+            "base_url": llm_summary.get("base_url"),
+            "api_key_configured": bool(llm_summary.get("api_key_configured")),
+        },
+        "evidence": {
+            "status": evidence_payload.get("status"),
+            "high_weight_papers": int(evidence_counts.get("high_weight_papers", 0) or 0),
+            "genome_cards": int(evidence_counts.get("genome_cards", 0) or 0),
+            "pattern_cards": int(evidence_counts.get("pattern_cards", 0) or 0),
+            "full_text_ready_papers": full_text_ready,
+            "abstract_only_papers": abstract_only,
+            "paper_like_full_text_papers": int(evidence_counts.get("paper_like_full_text_papers", 0) or 0),
+            "metadata_page_section_papers": metadata_page_sections,
+            "stale_genome_cards": stale_genome_cards,
+            "stale_pattern_cards": stale_pattern_cards,
+        },
+        "user_library": {
+            "count": int(user_library.get("count", 0) or 0),
+            "full_text_ready_count": int(user_library.get("full_text_ready_count", 0) or 0),
+            "policy": user_library.get("policy", ""),
+        },
+        "counts": counts,
+        "runtime": runtime_summary,
+        "issues": issues,
+        "next_commands": seen_commands,
+    }
+
+
+def print_doctor_payload(payload: Dict[str, object]) -> None:
+    llm = payload.get("llm", {}) if isinstance(payload.get("llm"), dict) else {}
+    evidence = payload.get("evidence", {}) if isinstance(payload.get("evidence"), dict) else {}
+    user_library = payload.get("user_library", {}) if isinstance(payload.get("user_library"), dict) else {}
+    runtime = payload.get("runtime", {}) if isinstance(payload.get("runtime"), dict) else {}
+    pdf_parser = runtime.get("pdf_parser", {}) if isinstance(runtime.get("pdf_parser"), dict) else {}
+    print(f"Doctor: {payload.get('overall_status')}")
+    print(f"LLM: provider={llm.get('provider')} model={llm.get('model')} api_key={'yes' if llm.get('api_key_configured') else 'no'}")
+    print(
+        "Runtime: "
+        f"pdf_parser={pdf_parser.get('parser', 'unknown')} "
+        f"available={'yes' if pdf_parser.get('available') else 'no'}"
+    )
+    print(
+        "Evidence: "
+        f"status={evidence.get('status')} "
+        f"gold={evidence.get('high_weight_papers')} "
+        f"genomes={evidence.get('genome_cards')} "
+        f"patterns={evidence.get('pattern_cards')} "
+        f"full_text={evidence.get('full_text_ready_papers')} "
+        f"paper_like={evidence.get('paper_like_full_text_papers')} "
+        f"metadata_page={evidence.get('metadata_page_section_papers')} "
+        f"abstract_only={evidence.get('abstract_only_papers')} "
+        f"stale_genomes={evidence.get('stale_genome_cards')} "
+        f"stale_patterns={evidence.get('stale_pattern_cards')}"
+    )
+    print(f"User library: papers={user_library.get('count')} full_text_hints={user_library.get('full_text_ready_count')}")
+    issues = payload.get("issues", [])
+    if isinstance(issues, list) and issues:
+        print("Issues:")
+        for item in issues[:8]:
+            if isinstance(item, dict):
+                print(f"  - [{item.get('severity')}] {item.get('code')}: {item.get('message')}")
+    else:
+        print("Issues: none")
+    commands = payload.get("next_commands", [])
+    if isinstance(commands, list) and commands:
+        print("Next:")
+        for command in commands[:8]:
+            print(f"  {command}")
+
+
 def print_llm_summary(config) -> None:
     summary = provider_summary(config.llm)
     for key in ("provider", "model", "base_url", "api_key_configured"):
@@ -1256,6 +1548,133 @@ def cmd_list_papers(root_dir: Path, limit: int) -> int:
     return 0
 
 
+def cmd_user_library(
+    root_dir: Path,
+    *,
+    action: str,
+    value: str | None,
+    url: str,
+    paper_id: int | None,
+    title: str,
+    note: str,
+    limit: int,
+    json_output: bool = False,
+) -> int:
+    config = load_config(root_dir)
+    ensure_layout(config)
+    init_db(config.db_path)
+    normalized_action = action.strip() or "list"
+    if normalized_action == "add":
+        raw_url = url.strip() or str(value or "").strip()
+        if not raw_url:
+            print("Need a URL. Use `ra ul add https://arxiv.org/abs/...`.", file=sys.stderr)
+            return 1
+        try:
+            validated_url = validate_user_library_url(raw_url)
+            metadata = user_library_metadata_from_url(validated_url, title=title, note=note)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        paper_id_value = upsert_user_library_paper(
+            config.db_path,
+            title=str(metadata.get("title", "")).strip(),
+            venue=str(metadata.get("venue", "")).strip(),
+            year=int(metadata.get("year", 0) or 0),
+            abstract=str(metadata.get("abstract", "")).strip(),
+            external_ref=validated_url,
+        )
+        payload = {"ok": True, "paper_id": paper_id_value, "paper": user_library_paper_payload(get_paper_by_id(config.db_path, paper_id_value))}
+        if json_output:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"Added user-library paper #{paper_id_value}: {payload['paper']['title']}")
+            print("Policy: domain knowledge only; not Gold evidence or scoring standard.")
+            print("Next: ra fulltext --user-library")
+        return 0
+    if normalized_action == "delete":
+        target = paper_id if paper_id is not None else None
+        if target is None and str(value or "").strip():
+            try:
+                target = int(str(value).strip())
+            except ValueError:
+                target = None
+        if target is None:
+            print("Need a user-library paper id. Use `ra ul delete 3`.", file=sys.stderr)
+            return 1
+        deleted = delete_user_library_paper(config.db_path, int(target))
+        payload = {"ok": bool(deleted), "paper_id": int(target)}
+        if not deleted:
+            if json_output:
+                print(json.dumps({**payload, "error": "user_library_paper_not_found"}, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"User-library paper not found: {target}", file=sys.stderr)
+            return 1
+        if json_output:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"Deleted user-library paper #{target}")
+        return 0
+    if normalized_action != "list":
+        print(f"Unknown user-library action: {normalized_action}", file=sys.stderr)
+        return 1
+    payload = build_user_library_cli_payload(config.db_path, limit=max(1, int(limit)))
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+    print_user_library_cli_payload(payload)
+    return 0
+
+
+def build_user_library_cli_payload(db_path: Path, *, limit: int) -> Dict[str, object]:
+    rows = list_user_library_papers(db_path, limit=max(1, int(limit)))
+    papers = []
+    for row in rows:
+        papers.append(user_library_paper_payload(row))
+    return {
+        "count": len(papers),
+        "full_text_ready_count": sum(1 for item in papers if item["full_text_ready"]),
+        "policy": "User-library papers are domain knowledge and route-learning context only; they never become Gold evidence, evidence_basis, storyline_trace source IDs, quality signals, or scoring standards.",
+        "papers": papers,
+    }
+
+
+def user_library_paper_payload(row: object) -> Dict[str, object]:
+    if not row:
+        return {}
+    row_dict = dict(row)
+    hints = user_library_full_text_domain_hints(row_dict)
+    return {
+        "paper_id": int(row_dict.get("id", 0) or 0),
+        "title": str(row_dict.get("title", "")).strip(),
+        "venue": str(row_dict.get("venue", "")).strip(),
+        "year": int(row_dict.get("year", 0) or 0),
+        "external_ref": str(row_dict.get("external_ref", "")).strip(),
+        "route_note": compact_excerpt(str(row_dict.get("abstract", "")).strip(), limit=220),
+        "full_text_hint_sections": sorted(hints.keys()),
+        "full_text_ready": bool(hints),
+        "source_kind": str(row_dict.get("source_kind", "")).strip(),
+        "paper_weight": float(row_dict.get("paper_weight", 0) or 0),
+        "policy": "user_library_domain_knowledge_only_never_scoring_standard",
+    }
+
+
+def print_user_library_cli_payload(payload: Dict[str, object]) -> None:
+    papers = payload.get("papers", [])
+    print(f"User library papers: {payload['count']} (full-text hints: {payload['full_text_ready_count']})")
+    print("Policy: domain knowledge only; not Gold evidence or scoring standard.")
+    if not papers:
+        print("No user-library papers yet. Add links from the GUI, then run `ra fulltext --user-library`.")
+        return
+    for item in papers:
+        sections = ", ".join(item["full_text_hint_sections"]) if item["full_text_hint_sections"] else "none"
+        print(f"[{item['paper_id']}] {item['year']} {item['venue']} :: {item['title']}")
+        print(f"  full_text_hints={sections} weight={item['paper_weight']:.1f} source={item['source_kind']}")
+        if item["external_ref"]:
+            print(f"  ref={item['external_ref']}")
+        if item["route_note"]:
+            print(f"  note={item['route_note']}")
+
+
 def cmd_harvest(
     root_dir: Path,
     file_path: str | None,
@@ -1326,6 +1745,133 @@ def cmd_harvest(
     return 0
 
 
+def cmd_gold_seed(
+    root_dir: Path,
+    *,
+    file_path: str,
+    limit: int,
+    fetch_full_text_after: bool,
+    extractive_genomes: bool,
+    timeout: int,
+    max_bytes: int,
+) -> int:
+    config = load_config(root_dir)
+    ensure_layout(config)
+    init_db(config.db_path)
+    path = Path(file_path)
+    if not path.is_absolute():
+        path = config.root_dir / path
+    if not path.exists():
+        print(f"Gold seed file not found: {path}", file=sys.stderr)
+        return 1
+
+    records = load_seed_records(path)[: max(1, int(limit))]
+    records, skipped_posters = reject_poster_records(records)
+    imported = 0
+    imported_ids: List[int] = []
+    skipped_non_gold: List[Dict[str, object]] = []
+    for record in records:
+        normalized_record = {
+            **record,
+            "source_kind": gold_source_kind("seed"),
+            "award": normalize_award_key(str(record.get("award", ""))),
+        }
+        if not is_core_gold_standard_paper(normalized_record):
+            skipped_non_gold.append(
+                {
+                    "title": str(record.get("title", "")).strip(),
+                    "venue": str(record.get("venue", "")).strip(),
+                    "year": int(record.get("year", 0) or 0),
+                    "award": str(record.get("award", "")).strip(),
+                    "reason": "not_core_gold_standard",
+                }
+            )
+            continue
+        limitations_json = str(record.get("limitations_json", "")).strip() or limitations_json_for_paper(record)
+        paper_id = add_paper(
+            config.db_path,
+            title=str(record.get("title", "")).strip(),
+            venue=str(record.get("venue", "")).strip(),
+            year=int(record.get("year", 0)),
+            abstract=str(record.get("abstract", "")).strip(),
+            source_kind=gold_source_kind("seed"),
+            external_ref=str(record.get("external_ref", "")).strip(),
+            award=normalize_award_key(str(record.get("award", ""))),
+            citation_count=int(record.get("citation_count", 0) or 0),
+            influential_citation_count=int(record.get("influential_citation_count", 0) or 0),
+            publication_date=str(record.get("publication_date", "")).strip(),
+            limitations_json=limitations_json,
+        )
+        imported_ids.append(paper_id)
+        imported += 1
+
+    scored = score_papers_in_db(config.db_path) if iter_papers(config.db_path) else 0
+    full_text_summary: Dict[str, object] = {}
+    if fetch_full_text_after:
+        rows = [get_paper_by_id(config.db_path, paper_id) for paper_id in imported_ids]
+        rows = core_gold_rows([row for row in rows if row])
+        full_text_summary = fetch_full_text_for_paper_rows(
+            config.db_path,
+            rows,
+            timeout=max(1, int(timeout)),
+            max_bytes=max(1, int(max_bytes)),
+        )
+    genome_outputs = []
+    if extractive_genomes:
+        genome_outputs = run_pipeline_genome_build(
+            config.root_dir,
+            limit=max(1, int(limit)),
+            provider=None,
+            model="",
+            include_existing=False,
+            extractive=True,
+            fetch_full_text_before=not fetch_full_text_after,
+        )
+
+    summary_payload = {
+        "source": gold_source_kind("seed"),
+        "file": str(path),
+        "read": len(records) + skipped_posters,
+        "imported": imported,
+        "poster_skipped": skipped_posters,
+        "non_gold_skipped": len(skipped_non_gold),
+        "scored_papers": scored,
+        "current_excellent_papers": count_scored_papers(config.db_path),
+        "full_text": full_text_summary,
+        "extractive_genome_drafts": len(genome_outputs),
+        "skipped_non_gold_examples": skipped_non_gold[:10],
+        "policy": (
+            "Local Gold seeds are admitted only when they satisfy core venue plus Best/Outstanding/Oral. "
+            "User-library papers remain domain knowledge only and are not imported by this command."
+        ),
+    }
+    print(
+        "Gold-seed summary: "
+        f"read={summary_payload['read']}; "
+        f"imported={imported}; "
+        f"poster_skipped={skipped_posters}; "
+        f"non_gold_skipped={len(skipped_non_gold)}; "
+        f"scored={scored}; "
+        f"excellent={summary_payload['current_excellent_papers']}"
+    )
+    if fetch_full_text_after:
+        print(
+            "Full-text: "
+            f"updated={full_text_summary.get('updated', 0)} "
+            f"skipped={full_text_summary.get('skipped', 0)} "
+            f"failed={full_text_summary.get('failed', 0)}"
+        )
+    if extractive_genomes:
+        print(f"Extractive Genome drafts: {len(genome_outputs)}")
+    print("Gold-seed summary JSON: " + json.dumps(summary_payload, ensure_ascii=False, sort_keys=True))
+    print("Next:")
+    print(f"  {CLI_CMD} evidence --papers 20")
+    print(f"  {CLI_CMD} fulltext --limit 20")
+    print(f"  {CLI_CMD} gb --limit 20")
+    print(f"  {CLI_CMD} pb --limit 10")
+    return 0
+
+
 def parse_csv_values(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -1340,6 +1886,7 @@ def cmd_gold_build(
     to_year: int,
     per_venue_year: int,
     extractive_genomes: bool,
+    fetch_full_text_after: bool = True,
 ) -> int:
     config = load_config(root_dir)
     ensure_layout(config)
@@ -1354,6 +1901,7 @@ def cmd_gold_build(
 
     metadata_only_remote = is_metadata_only_gold_build_remote(remote)
     imported = 0
+    imported_ids: List[int] = []
     candidate_imported = 0
     fetched_total = 0
     poster_skipped_total = 0
@@ -1464,7 +2012,7 @@ def cmd_gold_build(
                 )
             for record in qualified_records:
                 limitations_json = str(record.get("limitations_json", "")).strip() or limitations_json_for_paper(record)
-                add_paper(
+                paper_id = add_paper(
                     config.db_path,
                     title=str(record.get("title", "")).strip(),
                     venue=str(record.get("venue", "")).strip() or venue,
@@ -1478,6 +2026,7 @@ def cmd_gold_build(
                     publication_date=str(record.get("publication_date", "")).strip(),
                     limitations_json=limitations_json,
                 )
+                imported_ids.append(paper_id)
                 imported += 1
             progress_note(f"{year} {venue} 优秀依据库写入 {len(qualified_records)} 条")
             source_reports.append(
@@ -1498,6 +2047,24 @@ def cmd_gold_build(
 
     progress_note("重新计算优秀论文权重")
     scored = score_papers_in_db(config.db_path) if iter_papers(config.db_path) else 0
+    full_text_summary: Dict[str, object] = {}
+    if fetch_full_text_after and imported_ids:
+        rows = [get_paper_by_id(config.db_path, paper_id) for paper_id in imported_ids]
+        rows = core_gold_rows([row for row in rows if row])
+        progress_note(f"为 {len(rows)} 篇新增优秀论文补全文证据")
+        full_text_summary = fetch_full_text_for_paper_rows(
+            config.db_path,
+            rows,
+            timeout=45,
+            max_bytes=5_000_000,
+            verbose=False,
+        )
+        progress_note(
+            "全文证据补全完成："
+            f"updated={full_text_summary.get('updated', 0)} "
+            f"failed={full_text_summary.get('failed', 0)} "
+            f"skipped={full_text_summary.get('skipped', 0)}"
+        )
     genome_outputs = []
     if extractive_genomes:
         progress_note("为新增优秀论文构建可审计逻辑卡草稿")
@@ -1508,6 +2075,7 @@ def cmd_gold_build(
             model="",
             include_existing=False,
             extractive=True,
+            fetch_full_text_before=not bool(full_text_summary),
         )
 
     current_excellent = count_scored_papers(config.db_path)
@@ -1538,6 +2106,7 @@ def cmd_gold_build(
         "failures": len(failures),
         "scored_papers": scored,
         "current_excellent_papers": current_excellent,
+        "full_text": full_text_summary,
         "extractive_genome_drafts": len(genome_outputs),
         "source_failures": source_failures[:20],
         "source_empty_results": source_empty_results[:20],
@@ -1559,6 +2128,13 @@ def cmd_gold_build(
     print("Gold-build summary JSON: " + json.dumps(summary_payload, ensure_ascii=False, sort_keys=True))
     print(f"联网趋势论文 imported/updated {candidate_imported} records from {remote}.")
     print(f"优秀论文库 imported/updated {imported} records from {remote}.")
+    if fetch_full_text_after:
+        print(
+            "Full-text: "
+            f"updated={full_text_summary.get('updated', 0)} "
+            f"skipped={full_text_summary.get('skipped', 0)} "
+            f"failed={full_text_summary.get('failed', 0)}"
+        )
     print(f"Scored papers: {scored}")
     print(f"优秀论文: {current_excellent}")
     if extractive_genomes:
@@ -1792,6 +2368,104 @@ def cmd_limitations(root_dir: Path, months: int, limit: int) -> int:
     return 0
 
 
+def cmd_fulltext(root_dir: Path, *, paper_id: int | None, user_library: bool, limit: int, timeout: int, max_bytes: int) -> int:
+    config = load_config(root_dir)
+    ensure_layout(config)
+    init_db(config.db_path)
+    if paper_id:
+        row = get_paper_by_id(config.db_path, int(paper_id))
+        rows = [row] if row else []
+    elif user_library:
+        rows = list_user_library_papers(config.db_path, limit=max(1, int(limit)))
+    else:
+        rows = list_top_papers(config.db_path, limit=max(1, int(limit)))
+    if not rows:
+        print("No papers found for full-text extraction.", file=sys.stderr)
+        return 1
+
+    summary = fetch_full_text_for_paper_rows(
+        config.db_path,
+        rows,
+        timeout=max(1, int(timeout)),
+        max_bytes=max(1, int(max_bytes)),
+        verbose=True,
+    )
+    updated = int(summary.get("updated", 0) or 0)
+    failed = int(summary.get("failed", 0) or 0)
+    skipped = int(summary.get("skipped", 0) or 0)
+    print(f"Full-text extraction updated={updated} skipped={skipped} failed={failed}")
+    if updated or skipped:
+        return 0 if failed == 0 else 2
+    return 1
+
+
+def fetch_full_text_for_paper_rows(
+    db_path: Path,
+    rows: Iterable[object],
+    *,
+    timeout: int = 60,
+    max_bytes: int = 5_000_000,
+    verbose: bool = False,
+) -> Dict[str, object]:
+    updated = 0
+    failed = 0
+    skipped = 0
+    reports: List[Dict[str, object]] = []
+    for row in rows:
+        paper = dict(row)
+        paper_id = int(paper.get("id", 0) or paper.get("paper_id", 0) or 0)
+        title = str(paper.get("title", "")).strip()
+        ref = str(paper.get("external_ref", "")).strip()
+        existing_payload = sanitize_full_text_payload(parse_json_object(paper.get("full_text_json", "{}")))
+        existing_quality = str(existing_payload.get("quality", "")).strip()
+        if existing_quality in {"paper_like_sections", "paper_like_full_text"}:
+            skipped += 1
+            reports.append({"paper_id": paper_id, "title": title, "status": "skipped", "reason": "paper_like_full_text_already_available"})
+            if verbose:
+                print(f"[{paper_id}] skipped: paper-like full text already available", file=sys.stderr)
+            continue
+        if not ref:
+            skipped += 1
+            reports.append({"paper_id": paper_id, "title": title, "status": "skipped", "reason": "no_external_ref"})
+            if verbose:
+                print(f"[{paper_id}] skipped: no external_ref", file=sys.stderr)
+            continue
+        try:
+            text, normalized_url = fetch_full_text_with_metadata(
+                ref,
+                title=title,
+                venue=str(paper.get("venue", "")).strip(),
+                year=paper.get("year", ""),
+                timeout=max(1, int(timeout)),
+                max_bytes=max(1, int(max_bytes)),
+            )
+            payload = extract_section_evidence(text)
+            payload["source_url"] = normalized_url
+            payload["parser_hint"] = (
+                "pdf_or_openreview"
+                if normalized_url.lower().endswith(".pdf") or "openreview.net/pdf" in normalized_url.lower()
+                else "html_or_text"
+            )
+            update_paper_full_text(
+                db_path,
+                paper_id,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            )
+        except FullTextError as exc:
+            failed += 1
+            reports.append({"paper_id": paper_id, "title": title, "status": "failed", "reason": str(exc)})
+            if verbose:
+                print(f"[{paper_id}] full-text failed: {exc}", file=sys.stderr)
+            continue
+        updated += 1
+        sections = list(payload.get("available_sections", [])) if isinstance(payload.get("available_sections"), list) else []
+        reports.append({"paper_id": paper_id, "title": title, "status": "updated", "sections": sections})
+        if verbose:
+            section_text = ", ".join(sections) or "none"
+            print(f"[{paper_id}] full-text sections={section_text} :: {title}")
+    return {"updated": updated, "failed": failed, "skipped": skipped, "reports": reports}
+
+
 QUALITY_ENRICH_SYSTEM_PROMPT = """
 You are a scholarly metadata quality annotator.
 You may use your pretrained bibliographic knowledge only to identify paper quality metadata:
@@ -2015,6 +2689,12 @@ def cmd_evidence(root_dir: Path, paper_limit: int) -> int:
     print(f"High-weight papers: {payload['counts']['high_weight_papers']}")
     print(f"Genome cards: {payload['counts']['genome_cards']}")
     print(f"Pattern cards: {payload['counts']['pattern_cards']}")
+    print(f"Full-text ready papers: {payload['counts'].get('full_text_ready_papers', 0)}")
+    print(f"Paper-like full-text papers: {payload['counts'].get('paper_like_full_text_papers', 0)}")
+    print(f"Metadata-page section papers: {payload['counts'].get('metadata_page_section_papers', 0)}")
+    print(f"Abstract-only papers: {payload['counts'].get('abstract_only_papers', 0)}")
+    print(f"Stale genome cards: {payload['counts'].get('stale_genome_cards', 0)}")
+    print(f"Stale pattern cards: {payload['counts'].get('stale_pattern_cards', 0)}")
     print(f"JSON: {json_path}")
     print(f"Markdown: {markdown_path}")
     next_commands = payload.get("next_commands", [])
@@ -2183,6 +2863,7 @@ def cmd_run(
                 model=model,
                 include_existing=False,
                 extractive=extractive,
+                fetch_full_text_before=extractive,
             )
         except (LLMError, ValueError, json.JSONDecodeError) as exc:
             genome_outputs = []
@@ -2953,9 +3634,9 @@ def cmd_ideate(
         if isinstance(failures, list):
             for failure in failures[:3]:
                 if isinstance(failure, dict):
-                    print(f"  fallback note: {failure.get('remote')} failed: {failure.get('error')}")
+                    print(f"  fallback note: {failure.get('remote')}：{user_facing_remote_failure(failure.get('error'))}")
         if harvest_result.get("status") == "failed":
-            print("Remote frontier harvest failed; continuing with existing local evidence.", file=sys.stderr)
+            print("远程趋势抓取暂不可用，已继续使用本地证据。", file=sys.stderr)
     progress_note("重新计算论文质量权重，确保 Poster 和普通趋势论文不进入评分标准")
     score_papers_in_db(config.db_path)
     progress_note("构建近期热点趋势图")
@@ -3176,34 +3857,53 @@ def extractive_quality_note(paper: Dict[str, object]) -> str:
 def build_extractive_genome_payload(paper: Dict[str, object]) -> Dict[str, object]:
     title = str(paper.get("title", "")).strip()
     abstract = str(paper.get("abstract", "")).strip()
-    evidence_text = f"{title}. {abstract}".strip()
+    full_text_payload = sanitize_full_text_payload(parse_json_object(paper.get("full_text_json", "{}")))
+    sections = full_text_payload.get("sections") if isinstance(full_text_payload, dict) else {}
+    if not isinstance(sections, dict):
+        sections = {}
+    section_text = " ".join(str(sections.get(key, "")).strip() for key in [
+        "introduction",
+        "related_work",
+        "method",
+        "experiments",
+        "ablation",
+        "limitations",
+        "conclusion",
+    ] if str(sections.get(key, "")).strip())
+    full_text_quality = str(full_text_payload.get("quality", "")).strip()
+    has_full_text = bool(section_text.strip()) and full_text_quality in {"paper_like_sections", "paper_like_full_text"}
+    evidence_text = f"{title}. {section_text if has_full_text else abstract}".strip()
     terms = extract_terms(evidence_text)
     term_phrase = join_terms(terms, "the paper's stated problem framing")
-    excerpt = compact_excerpt(abstract or title, limit=240)
+    excerpt = compact_excerpt(section_text if has_full_text else (abstract or title), limit=320)
     quality_note = extractive_quality_note(paper)
+    evidence_level = EXTRACTIVE_FULL_TEXT_EVIDENCE_LEVEL if has_full_text else EXTRACTIVE_EVIDENCE_LEVEL
+    evidence_source_phrase = "full-text section evidence" if has_full_text else "metadata/abstract only"
     return {
         "paper_summary": (
             f"{title} is stored as high-quality evidence ({quality_note}). "
-            f"Extractive abstract signal: {excerpt}"
+            f"Extractive {evidence_source_phrase} signal: {excerpt}"
         ),
         "pre_publication_belief": (
-            "Extractive proxy from metadata/abstract only: the field context is represented by recurring terms "
+            f"Extractive proxy from {evidence_source_phrase}: the field context is represented by recurring terms "
             f"{term_phrase}."
         ),
         "bottleneck_or_hidden_assumption": (
-            "Extracted candidate bottleneck from the paper record: progress may depend on how the work reframes "
+            "Extracted candidate bottleneck from the paper evidence: progress may depend on how the work reframes "
             f"{term_phrase}."
         ),
         "problem_reframing": (
-            "Treat the paper's title/abstract move as a reframing standard, not a free-form model prior: "
+            "Treat the paper's stored evidence move as a reframing standard, not a free-form model prior: "
             f"{compact_excerpt(title, 160)}."
         ),
         "why_now": (
             f"Publication context: {paper.get('year')} {paper.get('venue')} with {quality_note}. "
-            "Use this only as metadata-level why-now evidence."
+            f"Use this as {evidence_source_phrase} why-now evidence."
         ),
         "evidence_design": (
-            "Metadata/abstract-only evidence; require future full-paper reading before claiming detailed experimental design."
+            "Full-text sections include the evidence-design context."
+            if has_full_text and str(sections.get("experiments", "")).strip()
+            else "Metadata/abstract-only evidence; require future full-paper reading before claiming detailed experimental design."
         ),
         "story_line": (
             "High-quality paper standard: make the abstract-level problem, move, and evidence feel connected and necessary."
@@ -3212,12 +3912,13 @@ def build_extractive_genome_payload(paper: Dict[str, object]) -> Dict[str, objec
             f"Transfer the paper's extractive move around {term_phrase} to a new frontier gap while preserving evidence traceability."
         ),
         "failure_boundary": (
-            "Fails if a proposed idea cannot cite this paper's stored title/abstract/quality signal or needs unstored full-paper claims."
+            "Fails if a proposed idea cannot cite this paper's stored title/abstract/full-text snippets/quality signal or needs unstored claims."
         ),
         "confidence_note": (
-            "Built without an LLM from local title, abstract, award, citation, and paper_weight fields only."
+            f"Built without an LLM from local {evidence_source_phrase}, award, citation, and paper_weight fields."
         ),
-        "evidence_level": EXTRACTIVE_EVIDENCE_LEVEL,
+        "evidence_level": evidence_level,
+        "full_text_sections_used": sorted(sections.keys()) if has_full_text else [],
     }
 
 
@@ -3328,11 +4029,21 @@ def logic_text_is_placeholder(logic_text: str) -> bool:
 
 
 def audit_genome_grounding(payload: Dict[str, object], paper: Dict[str, object]) -> Dict[str, object]:
+    evidence_level = str(payload.get("evidence_level", "")).strip()
+    full_text_payload = parse_json_object(paper.get("full_text_json", "{}"))
+    full_text_sections = full_text_payload.get("sections") if isinstance(full_text_payload, dict) else {}
+    full_text_corpus = " ".join(
+        str(value).strip()
+        for value in (full_text_sections or {}).values()
+        if str(value).strip()
+    ) if isinstance(full_text_sections, dict) else ""
     evidence_corpus = " ".join(
         str(paper.get(field, "")).strip()
         for field in ("title", "venue", "year", "award", "abstract")
         if str(paper.get(field, "")).strip()
     )
+    if full_text_corpus:
+        evidence_corpus = f"{evidence_corpus} {full_text_corpus}".strip()
     logic_line = payload.get("logic_line") if isinstance(payload.get("logic_line"), dict) else {}
     evidence = payload.get("logic_line_evidence") if isinstance(payload.get("logic_line_evidence"), dict) else {}
     failures: List[Dict[str, object]] = []
@@ -3367,13 +4078,24 @@ def audit_genome_grounding(payload: Dict[str, object], paper: Dict[str, object])
         failures.append({"code": "logic_line_outside_source_logic_space"})
 
     confidence_note = str(payload.get("confidence_note", "")).lower()
-    if "abstract" not in confidence_note and "metadata" not in confidence_note:
+    if evidence_level == "full_text_sections":
+        if not full_text_corpus:
+            failures.append({"code": "claimed_full_text_without_sections"})
+        if "full" not in confidence_note and "section" not in confidence_note:
+            failures.append({"code": "missing_full_text_confidence_note"})
+    elif "abstract" not in confidence_note and "metadata" not in confidence_note:
         failures.append({"code": "missing_abstract_only_confidence_note"})
 
     return {
         "status": "valid" if not failures else "invalid",
-        "policy": "logic_line_must_be_grounded_in_title_abstract_metadata",
+        "policy": (
+            "logic_line_must_be_grounded_in_full_text_sections_when_available"
+            if full_text_corpus
+            else "logic_line_must_be_grounded_in_title_abstract_metadata"
+        ),
         "source_paper_id": int(paper.get("id", 0) or 0),
+        "evidence_level": evidence_level or "abstract_only",
+        "full_text_sections_used": sorted((full_text_sections or {}).keys()) if isinstance(full_text_sections, dict) else [],
         "checked_steps": step_reports,
         "failures": failures,
     }
@@ -3475,6 +4197,75 @@ def core_gold_rows(rows: Iterable[object]) -> List[object]:
         if is_core_gold_standard_paper(item) and float(item.get("paper_weight", 0) or 0) > 0:
             kept.append(row)
     return kept
+
+
+def genome_card_needs_full_text_refresh(paper: Dict[str, object], evidence_level: object) -> bool:
+    return bool(genome_card_refresh_reason(paper, evidence_level))
+
+
+def genome_card_refresh_reason(paper: Dict[str, object], evidence_level: object) -> str:
+    status = full_text_status_for_paper(paper)
+    level = str(evidence_level or "").strip()
+    quality = str(status.get("quality", "")).strip()
+    has_paper_like_full_text = quality in {"paper_like_full_text", "paper_like_sections"}
+    claims_full_text = level in {"full_text_sections", EXTRACTIVE_FULL_TEXT_EVIDENCE_LEVEL} or (
+        "full_text" in level and "abstract" not in level
+    )
+    is_shallow = level in {"abstract_only", EXTRACTIVE_EVIDENCE_LEVEL, ""} or (
+        level.startswith("extractive_") and level != EXTRACTIVE_FULL_TEXT_EVIDENCE_LEVEL
+    )
+    if claims_full_text and not has_paper_like_full_text:
+        return "full_text_claim_not_supported"
+    if has_paper_like_full_text and is_shallow:
+        return "paper_like_full_text_available"
+    return ""
+
+
+def stale_full_text_genome_papers(db_path: Path, limit: int) -> List[object]:
+    rows = core_gold_rows(
+        list_papers_for_genome_build(
+            db_path,
+            limit=max(1000, count_idea_cards(db_path) + 10, int(limit) * 5),
+            only_missing=False,
+            high_weight_only=True,
+        )
+    )
+    card_rows = list_gold_genome_card_payloads(db_path, limit=max(1000, count_idea_cards(db_path) + 10))
+    evidence_by_paper_id = {int(row["paper_id"]): str(row["evidence_level"]).strip() for row in card_rows}
+    stale = [
+        row
+        for row in rows
+        if int(dict(row).get("id", 0) or 0) in evidence_by_paper_id
+        and genome_card_needs_full_text_refresh(dict(row), evidence_by_paper_id.get(int(dict(row).get("id", 0) or 0), ""))
+    ]
+    return stale[: max(1, int(limit))]
+
+
+def pattern_needs_genome_refresh(db_path: Path, payload: Dict[str, object]) -> bool:
+    source_ids = payload.get("source_paper_ids")
+    if not isinstance(source_ids, list):
+        source_ids = [
+            item.get("paper_id")
+            for item in payload.get("source_papers", [])
+            if isinstance(item, dict)
+        ] if isinstance(payload.get("source_papers"), list) else []
+    source_ids = [int(item) for item in source_ids if str(item).strip().isdigit()]
+    if not source_ids:
+        return False
+    rows = core_gold_rows(list_papers_for_genome_build(
+        db_path,
+        limit=max(1000, len(source_ids) + 10),
+        only_missing=False,
+        high_weight_only=True,
+    ))
+    papers_by_id = {int(row["id"]): dict(row) for row in rows}
+    genome_rows = list_gold_genome_card_payloads(db_path, limit=max(1000, count_idea_cards(db_path) + 10))
+    evidence_by_paper_id = {int(row["paper_id"]): str(row["evidence_level"]).strip() for row in genome_rows}
+    return any(
+        paper_id in papers_by_id
+        and genome_card_needs_full_text_refresh(papers_by_id[paper_id], evidence_by_paper_id.get(paper_id, ""))
+        for paper_id in source_ids
+    )
 
 
 def slugify_key(value: str, fallback: str = "extractive-evidence-transfer") -> str:
@@ -4057,6 +4848,50 @@ def quality_signal_label(source: Dict[str, object]) -> str:
     return str(source.get("evidence_level", "")).strip() or "stored_evidence"
 
 
+def gold_evidence_tier(source: Dict[str, object]) -> Dict[str, str]:
+    award_key = normalize_award_key(str(source.get("award", "")))
+    source_kind = str(source.get("source_kind", "")).strip().lower()
+    if is_user_library_source_kind(source_kind):
+        return {
+            "tier": "user_domain_knowledge",
+            "allowed_standard_use": "domain_knowledge_only_never_scoring_standard",
+        }
+    if is_poster_record(source):
+        return {
+            "tier": "frontier_context",
+            "allowed_standard_use": GOLD_EVIDENCE_TIER_POLICY["frontier_context"]["use"],
+        }
+    if award_key in {"best_paper", "test_of_time"}:
+        return {
+            "tier": "gold_complete_logic",
+            "allowed_standard_use": GOLD_EVIDENCE_TIER_POLICY["gold_complete_logic"]["use"],
+        }
+    if award_key == "outstanding_paper":
+        return {
+            "tier": "gold_problem_framing",
+            "allowed_standard_use": GOLD_EVIDENCE_TIER_POLICY["gold_problem_framing"]["use"],
+        }
+    if award_key == "oral":
+        return {
+            "tier": "gold_reviewer_clarity",
+            "allowed_standard_use": GOLD_EVIDENCE_TIER_POLICY["gold_reviewer_clarity"]["use"],
+        }
+    if award_key in {"spotlight", "high_citation"}:
+        return {
+            "tier": "trend_reference",
+            "allowed_standard_use": GOLD_EVIDENCE_TIER_POLICY["trend_reference"]["use"],
+        }
+    if is_frontier_source_kind(source_kind):
+        return {
+            "tier": "frontier_context",
+            "allowed_standard_use": GOLD_EVIDENCE_TIER_POLICY["frontier_context"]["use"],
+        }
+    return {
+        "tier": "ordinary_context",
+        "allowed_standard_use": "context_only_not_scoring_standard",
+    }
+
+
 def source_identity(source: Dict[str, object]) -> str:
     for key in ("pattern_key", "title", "paper_id", "id"):
         value = str(source.get(key, "")).strip()
@@ -4084,6 +4919,57 @@ def source_aliases(source: Dict[str, object]) -> set[str]:
     return {alias.lower() for alias in aliases if alias}
 
 
+def source_evidence_depth(source: Dict[str, object]) -> Dict[str, object]:
+    evidence_level = str(source.get("evidence_level", "")).strip()
+    if evidence_level in {"full_text_sections", EXTRACTIVE_FULL_TEXT_EVIDENCE_LEVEL}:
+        status = "full_text_sections"
+    elif "full_text" in evidence_level and "abstract" not in evidence_level:
+        status = "full_text_sections"
+    elif evidence_level.startswith("extractive_"):
+        status = "extractive_abstract_only"
+    else:
+        full_text = full_text_status_for_paper(source)
+        status = str(full_text.get("status", "")).strip()
+        if status not in {"full_text_sections", "abstract_or_metadata_only", "metadata_only"}:
+            status = "abstract_or_metadata_only" if normalize_text(source.get("abstract")) else "metadata_only"
+    section_count = 0
+    sections = source.get("full_text_sections_used", [])
+    if isinstance(sections, list):
+        section_count = len([item for item in sections if str(item).strip()])
+    if not section_count:
+        full_text = full_text_status_for_paper(source)
+        section_count = int(full_text.get("section_count", 0) or 0)
+        sections = full_text.get("available_sections", [])
+    full_text_quality = str(full_text_status_for_paper(source).get("quality", "")).strip()
+    if status == "full_text_sections":
+        if full_text_quality == "metadata_page_sections":
+            weight = 1.02
+            risk = "medium"
+        elif full_text_quality == "paper_like_sections":
+            weight = 1.1
+            risk = "low_medium"
+        else:
+            weight = 1.16
+            risk = "low"
+    elif status == "extractive_abstract_only":
+        weight = 0.92
+        risk = "medium"
+    elif status == "metadata_only":
+        weight = 0.82
+        risk = "high"
+    else:
+        weight = 0.88
+        risk = "medium"
+    return {
+        "status": status or "abstract_or_metadata_only",
+        "section_count": section_count,
+        "available_sections": sections if isinstance(sections, list) else [],
+        "quality": full_text_quality,
+        "weight": weight,
+        "risk": risk,
+    }
+
+
 def flatten_rubric_sources(
     *,
     pattern_rows=None,
@@ -4099,22 +4985,33 @@ def flatten_rubric_sources(
         payload["source_type"] = "pattern"
         payload["pattern_key"] = str(row["pattern_key"]).strip()
         payload.setdefault("quality_signal", "pattern_from_core_gold_genomes")
+        payload["evidence_depth"] = source_evidence_depth(payload)
         sources.append(payload)
     for row in genome_rows or []:
         try:
             payload = json.loads(row["content_json"])
         except (json.JSONDecodeError, KeyError, TypeError):
             continue
+        row_dict = dict(row)
         payload["source_type"] = "genome"
         payload["paper_id"] = int(row["paper_id"])
         payload["title"] = str(row["title"]).strip()
         payload["venue"] = str(row["venue"]).strip()
         payload["year"] = int(row["year"])
+        payload["evidence_level"] = str(row["evidence_level"]).strip()
+        if "award" in row_dict:
+            payload["award"] = str(row_dict["award"]).strip()
+        if "source_kind" in row_dict:
+            payload["source_kind"] = str(row_dict["source_kind"]).strip()
         payload.setdefault("quality_signal", str(row["evidence_level"]).strip())
+        payload.update(gold_evidence_tier(payload))
+        payload["evidence_depth"] = source_evidence_depth(payload)
         sources.append(payload)
     for row in paper_rows or []:
         payload = dict(row)
         payload["source_type"] = "paper"
+        payload.update(gold_evidence_tier(payload))
+        payload["evidence_depth"] = source_evidence_depth(payload)
         sources.append(payload)
     return sources
 
@@ -4133,6 +5030,7 @@ def build_quality_evidence_summary(root_dir: Path, *, pattern_limit: int, genome
             "their Idea Genome Cards, and Pattern Cards derived from those cards. "
             "Spotlight, high-citation-only, Poster, auxiliary-venue, and ordinary papers are trend context only."
         ),
+        "gold_evidence_tier_policy": GOLD_EVIDENCE_TIER_POLICY,
         "rubric_dimensions": [
             {
                 "key": item["key"],
@@ -4157,6 +5055,8 @@ def build_quality_evidence_summary(root_dir: Path, *, pattern_limit: int, genome
                 "influential_citation_count": int(row["influential_citation_count"]),
                 "paper_weight": float(row["paper_weight"]),
                 "quality_signal": quality_signal_label(dict(row)),
+                "full_text_status": full_text_status_for_paper(dict(row)),
+                **gold_evidence_tier(dict(row)),
             }
             for row in top_rows
             if is_core_gold_standard_paper(dict(row)) and float(row["paper_weight"] or 0) > 0
@@ -4174,6 +5074,9 @@ def build_quality_evidence_summary(root_dir: Path, *, pattern_limit: int, genome
                 "title": str(row["title"]).strip(),
                 "venue": str(row["venue"]).strip(),
                 "year": int(row["year"]),
+                "evidence_level": str(row["evidence_level"]).strip(),
+                "quality_signal": quality_signal_label(dict(row)),
+                **gold_evidence_tier(dict(row)),
                 "content": json.loads(row["content_json"]),
             }
             for row in genome_rows
@@ -4187,15 +5090,19 @@ def build_user_domain_knowledge_summary(root_dir: Path, *, limit: int = 12) -> D
     rows = list_user_library_papers(config.db_path, limit=max(1, limit))
     papers = []
     for row in rows:
+        full_text_hints = user_library_full_text_domain_hints(dict(row))
+        paper_item = {
+            "paper_id": int(row["id"]),
+            "title": str(row["title"]).strip(),
+            "venue": str(row["venue"]).strip(),
+            "year": int(row["year"]),
+            "external_ref": str(row["external_ref"]).strip(),
+            "route_note": compact_excerpt(str(row["abstract"]).strip(), limit=280),
+        }
+        if full_text_hints:
+            paper_item["full_text_domain_hints"] = full_text_hints
         papers.append(
-            {
-                "paper_id": int(row["id"]),
-                "title": str(row["title"]).strip(),
-                "venue": str(row["venue"]).strip(),
-                "year": int(row["year"]),
-                "external_ref": str(row["external_ref"]).strip(),
-                "route_note": compact_excerpt(str(row["abstract"]).strip(), limit=280),
-            }
+            paper_item
         )
     return {
         "source_policy": (
@@ -4207,6 +5114,30 @@ def build_user_domain_knowledge_summary(root_dir: Path, *, limit: int = 12) -> D
         "forbidden_uses": ["evidence_basis", "storyline_trace.source_id", "quality_signal", "paper_weight", "scoring_standard"],
         "papers": papers,
     }
+
+
+def user_library_full_text_domain_hints(row: Dict[str, object], *, max_sections: int = 4) -> Dict[str, str]:
+    full_text = parse_json_object(row.get("full_text_json", "{}"))
+    sections = full_text.get("sections") if isinstance(full_text, dict) else {}
+    if not isinstance(sections, dict):
+        return {}
+    preferred = [
+        "introduction",
+        "related_work",
+        "method",
+        "experiments",
+        "limitations",
+        "conclusion",
+    ]
+    hints: Dict[str, str] = {}
+    for key in preferred:
+        value = str(sections.get(key, "")).strip()
+        if not value:
+            continue
+        hints[key] = compact_excerpt(value, limit=360)
+        if len(hints) >= max(1, int(max_sections)):
+            break
+    return hints
 
 
 def merge_latest_user_domain_knowledge(root_dir: Path, session_context: Dict[str, object], *, limit: int = 12) -> Dict[str, object]:
@@ -4248,12 +5179,15 @@ def score_dimension_against_sources(
         quality_weight = 1.0 + min(1.5, float(source.get("paper_weight", 0) or 0) / 6.0)
         if str(source.get("award", "")).strip():
             quality_weight += 0.5
+        evidence_depth = source_evidence_depth(source)
+        quality_weight *= float(evidence_depth.get("weight", 1.0) or 1.0)
         overlap_score = min(1.0, len(overlap) / 5.0)
         matches.append(
             {
                 "source_type": str(source.get("source_type", "evidence")),
                 "source_id": source_identity(source),
                 "quality_signal": quality_signal_label(source),
+                "evidence_depth": evidence_depth,
                 "matched_field": best_field,
                 "evidence_excerpt": compact_excerpt(best_value),
                 "matched_terms": sorted(overlap)[:8],
@@ -4376,6 +5310,50 @@ def evidence_basis_used_for_dimensions(items: List[Dict[str, object]]) -> set[st
     return covered
 
 
+def evidence_depth_audit(matched_basis: List[Dict[str, object]]) -> Dict[str, object]:
+    counts = {
+        "full_text_sections": 0,
+        "abstract_or_metadata_only": 0,
+        "extractive_abstract_only": 0,
+        "metadata_only": 0,
+    }
+    for item in matched_basis:
+        depth = item.get("matched_evidence_depth", {})
+        status = str(depth.get("status", "")).strip() if isinstance(depth, dict) else str(depth).strip()
+        if status not in counts:
+            status = "abstract_or_metadata_only"
+        counts[status] += 1
+    total = sum(counts.values())
+    full_text_ratio = round(counts["full_text_sections"] / total, 3) if total else 0.0
+    if total and counts["full_text_sections"] == total:
+        status = "full_text_grounded"
+        risk = "low"
+        penalty = 0.0
+    elif counts["full_text_sections"]:
+        status = "mixed_depth"
+        risk = "medium"
+        penalty = -0.2
+    elif total:
+        status = "abstract_only_grounded"
+        risk = "medium_high"
+        penalty = -0.45
+    else:
+        status = "missing_matched_evidence"
+        risk = "high"
+        penalty = -0.6
+    return {
+        "status": status,
+        "risk": risk,
+        "penalty": penalty,
+        "counts": counts,
+        "full_text_ratio": full_text_ratio,
+        "note": (
+            "Prefer full-text/section-level Gold evidence for accepted ideas. "
+            "Abstract-only matched evidence remains usable but carries a depth risk."
+        ),
+    }
+
+
 def audit_generation_evidence(payload: Dict[str, object], sources: List[Dict[str, object]]) -> Dict[str, object]:
     explicit_basis = normalize_explicit_evidence_basis(payload.get("evidence_basis"))
     source_alias_map: Dict[str, List[Dict[str, object]]] = {}
@@ -4409,6 +5387,7 @@ def audit_generation_evidence(payload: Dict[str, object], sources: List[Dict[str
                     "matched_source_type": str(source.get("source_type", "")).strip(),
                     "matched_source_id": source_identity(source),
                     "matched_quality_signal": quality_signal_label(source),
+                    "matched_evidence_depth": source_evidence_depth(source),
                 }
             )
         elif candidates and declared_type:
@@ -4426,6 +5405,9 @@ def audit_generation_evidence(payload: Dict[str, object], sources: List[Dict[str
                     ),
                     "matched_source_id": "|".join(dict.fromkeys(source_identity(candidate) for candidate in candidates)),
                     "matched_quality_signal": "|".join(dict.fromkeys(quality_signal_label(candidate) for candidate in candidates)),
+                    "matched_evidence_depth": "|".join(
+                        dict.fromkeys(str(source_evidence_depth(candidate).get("status", "")) for candidate in candidates)
+                    ),
                 }
             )
         else:
@@ -4447,6 +5429,7 @@ def audit_generation_evidence(payload: Dict[str, object], sources: List[Dict[str
     covered_uses = sorted(evidence_basis_used_for_dimensions(matched))
     required_uses = [str(item["key"]) for item in EVIDENCE_RUBRIC_DIMENSIONS]
     missing_uses = [dimension for dimension in required_uses if dimension not in covered_uses]
+    depth_audit = evidence_depth_audit(matched)
 
     return {
         "status": status,
@@ -4457,6 +5440,7 @@ def audit_generation_evidence(payload: Dict[str, object], sources: List[Dict[str
         "source_type_mismatch_count": len(source_type_mismatches),
         "covered_uses": covered_uses,
         "missing_uses": missing_uses,
+        "evidence_depth": depth_audit,
         "matched_basis": matched,
         "unmatched_basis": unmatched,
         "source_type_mismatches": source_type_mismatches,
@@ -4520,12 +5504,16 @@ def build_evidence_grounded_score(
             "complementary": -0.25,
             "distant": 0.25,
         }.get(str(prior_art.get("overlap_label", "")).strip(), 0.0)
-    total = round(max(0.0, min(10.0, total + prior_penalty + float(generation_audit["penalty"]))), 2)
+    depth_audit = generation_audit.get("evidence_depth", {})
+    depth_penalty = float(depth_audit.get("penalty", 0.0) or 0.0) if isinstance(depth_audit, dict) else 0.0
+    total = round(max(0.0, min(10.0, total + prior_penalty + float(generation_audit["penalty"]) + depth_penalty)), 2)
     return {
         "total": total,
         "scale": "0-10",
         "prior_art_adjustment": prior_penalty,
         "generation_evidence_adjustment": float(generation_audit["penalty"]),
+        "evidence_depth_adjustment": depth_penalty,
+        "evidence_depth": depth_audit,
         "dimensions": dimensions,
         "rubric_source": (
             "Derived strictly from stored core Gold evidence: explicit Best/Outstanding/Oral paper standards, "
@@ -5607,6 +6595,7 @@ You are a prior-art and novelty investigation expert for top-tier AI/ML conferen
 Your job is mandatory screening before any generated idea can be accepted.
 Use only the supplied candidate idea and supplied local/frontier paper corpus. Do not invent outside papers.
 If similar work appears to already cover the core contribution, set decision to duplicate_rethink.
+If the idea only renames an existing paper's target domain, method, benchmark, or construct, set decision to duplicate_rethink.
 If no close match appears, explain why this has plausibly not been done yet using evidence from limitations, feasibility barriers, missing evaluation setup, data/tooling gaps, or timing.
 Return strict JSON only.
 """.strip()
@@ -5634,7 +6623,7 @@ def build_prior_art_gate_prompt(
             "paper_weight": float(paper.get("paper_weight", 0) or 0),
             "abstract": compact_excerpt(str(paper.get("abstract", "")).strip(), limit=520),
         }
-        for paper in paper_corpus[:40]
+        for paper in paper_corpus[:60]
     ]
     payload = {
         "policy": (
@@ -5657,13 +6646,16 @@ def build_prior_art_gate_prompt(
         f"{language_instruction}\n\n"
         "Decision policy:\n"
         "- duplicate_rethink: closest work already covers the core hypothesis, method/evaluation, or paper angle.\n"
+        "- duplicate_rethink: the idea is a renamed-only transfer with no new novelty boundary.\n"
         "- revise: nearby work exists and the idea needs sharper differentiation, but a plausible novel angle remains.\n"
         "- pass: no close prior-art coverage in the supplied evidence and the why-not-done-yet explanation is concrete.\n\n"
         "Return JSON only with this schema:\n"
         "{\n"
         '  "decision": "pass|revise|duplicate_rethink",\n'
         '  "overlap_label": "distant|complementary|near_miss|duplicate",\n'
-        '  "closest_work": [{"paper_id": 0, "title": "...", "overlap_reason": "...", "covered_parts": ["..."], "missing_parts": ["..."]}],\n'
+        '  "closest_work": [{"paper_id": 0, "title": "...", "overlap_reason": "...", "covered_parts": ["..."], "missing_parts": ["..."], "difference_from_idea": "..."}],\n'
+        '  "renamed_only_risk": "low|medium|high",\n'
+        '  "novelty_boundary": "...",\n'
         '  "why_not_done_yet": ["..."],\n'
         '  "required_differentiation": ["..."],\n'
         '  "rethink_prompt": "...",\n'
@@ -5699,6 +6691,12 @@ def parse_prior_art_gate_response(text: str) -> Dict[str, object]:
     payload["overlap_label"] = overlap_label
     if not isinstance(payload["closest_work"], list):
         raise ValueError("Prior-art gate closest_work must be a list")
+    payload["closest_work"] = normalize_prior_art_closest_work(payload["closest_work"])
+    renamed_only_risk = str(payload.get("renamed_only_risk", "")).strip().lower() or "low"
+    if renamed_only_risk not in {"low", "medium", "high"}:
+        raise ValueError("Prior-art gate renamed_only_risk must be low, medium, or high")
+    payload["renamed_only_risk"] = renamed_only_risk
+    payload["novelty_boundary"] = str(payload.get("novelty_boundary", "")).strip()
     if not isinstance(payload["why_not_done_yet"], list):
         raise ValueError("Prior-art gate why_not_done_yet must be a list")
     if not isinstance(payload["required_differentiation"], list):
@@ -5713,6 +6711,32 @@ def parse_prior_art_gate_response(text: str) -> Dict[str, object]:
     return payload
 
 
+def normalize_prior_art_closest_work(items: List[object]) -> List[Dict[str, object]]:
+    normalized = []
+    for item in items[:10]:
+        if not isinstance(item, dict):
+            continue
+        normalized.append(
+            {
+                "paper_id": int(item.get("paper_id", 0) or 0),
+                "title": str(item.get("title", "")).strip(),
+                "overlap_reason": str(item.get("overlap_reason", item.get("reason", ""))).strip(),
+                "covered_parts": [
+                    str(part).strip()
+                    for part in item.get("covered_parts", [])
+                    if str(part).strip()
+                ] if isinstance(item.get("covered_parts", []), list) else [],
+                "missing_parts": [
+                    str(part).strip()
+                    for part in item.get("missing_parts", [])
+                    if str(part).strip()
+                ] if isinstance(item.get("missing_parts", []), list) else [],
+                "difference_from_idea": str(item.get("difference_from_idea", "")).strip(),
+            }
+        )
+    return normalized
+
+
 def fallback_prior_art_gate(local_prior_art: Dict[str, object]) -> Dict[str, object]:
     label = str(local_prior_art.get("overlap_label", "")).strip().lower() or "distant"
     top_matches = local_prior_art.get("top_matches", [])
@@ -5725,14 +6749,17 @@ def fallback_prior_art_gate(local_prior_art: Dict[str, object]) -> Dict[str, obj
             "title": str(item.get("title", "")).strip() if isinstance(item, dict) else "",
             "overlap_reason": str(item.get("reason", "")).strip() if isinstance(item, dict) else "",
             "covered_parts": list(item.get("overlap_terms", [])) if isinstance(item, dict) and isinstance(item.get("overlap_terms"), list) else [],
-            "missing_parts": [],
+            "missing_parts": list(item.get("missing_parts", [])) if isinstance(item, dict) and isinstance(item.get("missing_parts"), list) else [],
+            "difference_from_idea": "Local fallback can only compare metadata and abstracts; verify full text for exact differences.",
         }
-        for item in top_matches[:3]
+        for item in top_matches[:10]
     ]
     return {
         "decision": decision,
         "overlap_label": label if label in {"distant", "complementary", "near_miss", "duplicate"} else "distant",
         "closest_work": closest_work,
+        "renamed_only_risk": str(local_prior_art.get("renamed_only_risk", "low")).strip() or "low",
+        "novelty_boundary": str(local_prior_art.get("novelty_boundary", "")).strip(),
         "why_not_done_yet": [
             "Local metadata/abstract screen found no exact blocker; full-paper verification is still needed."
             if decision != "duplicate_rethink"
@@ -5794,6 +6821,11 @@ def run_prior_art_gate(
     gate["local_prior_art"] = local_prior_art
     if gate["overlap_label"] == "duplicate":
         gate["decision"] = "duplicate_rethink"
+    if str(gate.get("renamed_only_risk", "")).strip() == "high":
+        gate["decision"] = "duplicate_rethink"
+        gate["required_differentiation"] = list(gate.get("required_differentiation", [])) + [
+            "The idea currently looks like renamed-only prior art; change the core causal boundary before acceptance."
+        ]
     if gate["decision"] == "pass" and not [item for item in gate.get("why_not_done_yet", []) if str(item).strip()]:
         gate["decision"] = "revise"
         gate["required_differentiation"] = list(gate.get("required_differentiation", [])) + [
@@ -6103,6 +7135,7 @@ def review_to_refinement_instruction(review: Dict[str, object], round_index: int
     required = compact_list(review.get("required_rethink", []), limit=5, chars=180) if isinstance(review.get("required_rethink", []), list) else []
     parts = [
         f"根据第 {round_index}/{total_rounds} 轮顶会审稿意见改写当前 idea。",
+        "这不是重复润色。你必须先站在审稿专家立场识别旧版最可能被拒的漏洞和理由，再站在作者立场批判性修补这些漏洞。",
         "目标：输出更抗审稿攻击的最终 idea，但必须保留原有 Pattern/Genome/Gold 逻辑空间；不要把用户论文库或趋势论文当评分标准。",
     ]
     if review.get("summary"):
@@ -6117,8 +7150,48 @@ def review_to_refinement_instruction(review: Dict[str, object], round_index: int
         parts.append("必须重想：" + "；".join(required))
     if review.get("rethink_trigger"):
         parts.append("触发条件：" + compact_excerpt(str(review.get("rethink_trigger", "")), limit=220))
-    parts.append("请给出一版可直接作为最终 idea 的改写，包含核心假设、证据设计、失败边界和最小实验。")
+    parts.append(
+        "改写要求：1) 不要只换说法；2) 必须改变至少一个核心假设、证据路径、失败边界或 novelty 边界；"
+        "3) 明确哪些攻击已被修补，哪些风险仍保留；4) 给出一版可直接作为最终 idea 的改写，包含核心假设、证据设计、失败边界和最小实验。"
+    )
     return "\n".join(parts)
+
+
+def mark_latest_session_turn_hidden(
+    db_path: Path,
+    session_id: int,
+    *,
+    source: str,
+    review_round: int,
+    total_rounds: int,
+) -> None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT id, content_json
+            FROM idea_session_turns
+            WHERE session_id = ?
+            ORDER BY turn_index DESC
+            LIMIT 1
+            """,
+            (int(session_id),),
+        ).fetchone()
+        if not row:
+            return
+        try:
+            payload = json.loads(str(row["content_json"] or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["source"] = source
+        payload["hidden_in_gui_chat"] = True
+        payload["review_round"] = int(review_round)
+        payload["total_rounds"] = int(total_rounds)
+        conn.execute(
+            "UPDATE idea_session_turns SET content_json = ? WHERE id = ?",
+            (json.dumps(payload, ensure_ascii=False, indent=2), int(row["id"])),
+        )
 
 
 def cmd_review_loop(
@@ -6208,6 +7281,13 @@ def cmd_review_loop(
                 )
             )
             return step_code
+        mark_latest_session_turn_hidden(
+            config.db_path,
+            resolved_session_id,
+            source="review_loop_refinement",
+            review_round=idx,
+            total_rounds=total_rounds,
+        )
         completed_rounds = idx
         if idx >= 3 and str(review.get("decision", "")).strip() == "proceed":
             progress_note("审稿人已给出 proceed，达到最小循环轮数后停止")
@@ -6486,13 +7566,13 @@ def cmd_session_step(
         revised_idea=critique_payload["revised_idea"],
         content_json=content_json,
     )
-    refresh_session_memory(config.root_dir, resolved_session_id)
+    refresh_session_memory(config.root_dir, resolved_session_id, session_base_context)
 
     session_dir = config.output_dir / "sessions"
     session_dir.mkdir(parents=True, exist_ok=True)
     output_path = session_dir / f"session-{resolved_session_id}-turn-{turn_id}.json"
     output_path.write_text(content_json, encoding="utf-8")
-    memory = refresh_session_memory(config.root_dir, resolved_session_id)
+    memory = refresh_session_memory(config.root_dir, resolved_session_id, session_base_context)
     dossier, dossier_path = refresh_session_dossier(config.root_dir, resolved_session_id)
 
     print(f"Turn {turn_id} decision: {critique_payload['decision']}")
@@ -6715,19 +7795,48 @@ def cmd_genome_build(
     model: str,
     include_existing: bool,
     extractive: bool,
+    refresh_stale: bool = False,
+    dry_run: bool = False,
 ) -> int:
     config = load_config(root_dir)
     ensure_layout(config)
     init_db(config.db_path)
 
-    papers = core_gold_rows(list_papers_for_genome_build(
-        config.db_path,
-        limit=max(1, limit) * 3,
-        only_missing=not include_existing,
-        high_weight_only=True,
-    ))[: max(1, limit)]
+    if refresh_stale:
+        papers = stale_full_text_genome_papers(config.db_path, limit=max(1, limit))
+    else:
+        papers = core_gold_rows(list_papers_for_genome_build(
+            config.db_path,
+            limit=max(1, limit) * 3,
+            only_missing=not include_existing,
+            high_weight_only=True,
+        ))[: max(1, limit)]
     if not papers:
         print("No candidate papers found for batch genome generation.")
+        return 0
+    if refresh_stale and extractive:
+        existing_rows = list_gold_genome_card_payloads(config.db_path, limit=max(1000, count_idea_cards(config.db_path) + 10))
+        existing_levels = {int(row["paper_id"]): str(row["evidence_level"]).strip() for row in existing_rows}
+        filtered = []
+        skipped_strict = []
+        for paper in papers:
+            level = existing_levels.get(int(paper["id"]), "")
+            if level and not level.startswith("extractive_"):
+                skipped_strict.append(int(paper["id"]))
+            else:
+                filtered.append(paper)
+        papers = filtered
+        if skipped_strict:
+            print(
+                "Skipped non-extractive Genome cards during extractive stale refresh: "
+                + ", ".join(str(item) for item in skipped_strict),
+                file=sys.stderr,
+            )
+        if not papers:
+            print("No extractive Genome cards need stale refresh.")
+            return 0
+    if dry_run:
+        print_genome_build_dry_run(config.db_path, papers, extractive=extractive, refresh_stale=refresh_stale)
         return 0
 
     created = 0
@@ -6752,6 +7861,27 @@ def cmd_genome_build(
     for paper_id, output_path in outputs:
         print(f"  paper #{paper_id}: {output_path}")
     return 0
+
+
+def print_genome_build_dry_run(db_path: Path, papers: List[object], *, extractive: bool, refresh_stale: bool) -> None:
+    existing_rows = list_gold_genome_card_payloads(db_path, limit=max(1000, count_idea_cards(db_path) + 10))
+    existing_levels = {int(row["paper_id"]): str(row["evidence_level"]).strip() for row in existing_rows}
+    mode = "extractive" if extractive else "llm"
+    action = "stale refresh" if refresh_stale else "generation"
+    print(f"Genome build dry-run: mode={mode} action={action} candidates={len(papers)}")
+    print(f"LLM calls: {'no' if extractive else 'yes'}")
+    for paper in papers:
+        item = dict(paper)
+        paper_id = int(item.get("id", 0) or 0)
+        status = full_text_status_for_paper(item)
+        reason = genome_card_refresh_reason(item, existing_levels.get(paper_id, "")) if refresh_stale else ""
+        print(
+            f"  - paper #{paper_id}: "
+            f"level={existing_levels.get(paper_id, 'missing') or 'missing'} "
+            f"quality={status.get('quality')} "
+            f"reason={reason or 'candidate'} "
+            f"title={str(item.get('title', '')).strip()[:90]}"
+        )
 
 
 def load_seed_records(path: Path) -> List[dict]:
@@ -7171,7 +8301,12 @@ def generate_genome_for_paper(
     paper_payload = dict(paper)
     if extractive:
         payload = build_extractive_genome_payload(paper_payload)
-        return write_genome_payload(config, paper_payload, payload, EXTRACTIVE_EVIDENCE_LEVEL)
+        return write_genome_payload(
+            config,
+            paper_payload,
+            payload,
+            str(payload.get("evidence_level", "")).strip() or EXTRACTIVE_EVIDENCE_LEVEL,
+        )
 
     apply_llm_runtime_overrides(config, provider, model)
     client = LLMClient(config.llm)
@@ -7186,7 +8321,8 @@ def generate_genome_for_paper(
             + json.dumps(payload["grounding_audit"]["failures"][:3], ensure_ascii=False)
         )
 
-    return write_genome_payload(config, paper_payload, payload, "abstract_only")
+    evidence_level = str(payload.get("evidence_level", "")).strip() or "abstract_only"
+    return write_genome_payload(config, paper_payload, payload, evidence_level)
 
 
 def run_pipeline_genome_build(
@@ -7196,18 +8332,38 @@ def run_pipeline_genome_build(
     model: str,
     include_existing: bool,
     extractive: bool = False,
+    fetch_full_text_before: bool = False,
+    refresh_stale: bool = False,
 ) -> List[Tuple[int, Path]]:
     config = load_config(root_dir)
     ensure_layout(config)
     init_db(config.db_path)
 
-    papers = core_gold_rows(list_papers_for_genome_build(
-        config.db_path,
-        limit=max(1, limit) * 3,
-        only_missing=not include_existing,
-        high_weight_only=True,
-    ))[: max(1, limit)]
+    if refresh_stale:
+        papers = stale_full_text_genome_papers(config.db_path, limit=max(1, limit))
+    else:
+        papers = core_gold_rows(list_papers_for_genome_build(
+            config.db_path,
+            limit=max(1, limit) * 3,
+            only_missing=not include_existing,
+            high_weight_only=True,
+        ))[: max(1, limit)]
     progress_note(f"准备从 {len(papers)} 篇优秀论文抽取 Genome 逻辑线")
+    if fetch_full_text_before and papers:
+        progress_note("先尝试抓取/解析优秀论文全文证据块，失败则降级继续")
+        full_text_summary = fetch_full_text_for_paper_rows(
+            config.db_path,
+            papers,
+            timeout=45,
+            max_bytes=5_000_000,
+            verbose=False,
+        )
+        progress_note(
+            "全文证据预处理完成："
+            f"updated={full_text_summary.get('updated', 0)} "
+            f"failed={full_text_summary.get('failed', 0)} "
+            f"skipped={full_text_summary.get('skipped', 0)}"
+        )
     outputs: List[Tuple[int, Path]] = []
     failures: List[str] = []
     for paper in papers:
@@ -7370,6 +8526,8 @@ def compute_strict_evidence_readiness(db_path: Path, paper_limit: int) -> Dict[s
             "influential_citation_count": int(row["influential_citation_count"]),
             "paper_weight": float(row["paper_weight"]),
             "quality_signal": quality_signal_label(dict(row)),
+            "full_text_status": full_text_status_for_paper(dict(row)),
+            **gold_evidence_tier(dict(row)),
         }
         for row in top_rows
         if float(row["paper_weight"]) > 0
@@ -7380,6 +8538,10 @@ def compute_strict_evidence_readiness(db_path: Path, paper_limit: int) -> Dict[s
             genome_payload = json.loads(row["content_json"])
         except (json.JSONDecodeError, TypeError):
             genome_payload = {}
+        paper_payload = dict(row)
+        card_full_text_status = full_text_status_for_paper(paper_payload)
+        card_evidence_level = str(row["evidence_level"]).strip()
+        refresh_reason = genome_card_refresh_reason(paper_payload, card_evidence_level)
         genome_cards.append(
             {
             "card_id": int(row["id"]),
@@ -7387,9 +8549,12 @@ def compute_strict_evidence_readiness(db_path: Path, paper_limit: int) -> Dict[s
             "title": str(row["title"]).strip(),
             "venue": str(row["venue"]).strip(),
             "year": int(row["year"]),
-            "evidence_level": str(row["evidence_level"]).strip(),
+            "evidence_level": card_evidence_level,
             "logic_line_complete": has_complete_genome_logic_line(genome_payload),
             "grounding_audit_valid": genome_grounding_audit_is_valid(genome_payload),
+            "full_text_status": card_full_text_status,
+            "needs_full_text_refresh": bool(refresh_reason),
+            "full_text_refresh_reason": refresh_reason,
         }
         )
     strict_genome_cards = [
@@ -7416,6 +8581,7 @@ def compute_strict_evidence_readiness(db_path: Path, paper_limit: int) -> Dict[s
             "source_set_policy": str(pattern_payload.get("source_set_policy", "")).strip(),
             "gold_only_source_provenance": pattern_source_provenance_is_current_gold_only(db_path, pattern_payload),
             "source_paper_ids": pattern_payload.get("source_paper_ids", []),
+            "needs_genome_refresh": pattern_needs_genome_refresh(db_path, pattern_payload),
         }
         )
     strict_pattern_cards = [
@@ -7432,6 +8598,28 @@ def compute_strict_evidence_readiness(db_path: Path, paper_limit: int) -> Dict[s
         "pattern_cards": len(pattern_cards),
         "strict_genome_cards": len(strict_genome_cards),
         "strict_pattern_cards": len(strict_pattern_cards),
+        "full_text_ready_papers": sum(
+            1
+            for paper in high_weight_papers
+            if str((paper.get("full_text_status") or {}).get("status", "")).strip() == "full_text_sections"
+        ),
+        "abstract_only_papers": sum(
+            1
+            for paper in high_weight_papers
+            if str((paper.get("full_text_status") or {}).get("status", "")).strip() == "abstract_or_metadata_only"
+        ),
+        "paper_like_full_text_papers": sum(
+            1
+            for paper in high_weight_papers
+            if str((paper.get("full_text_status") or {}).get("quality", "")).strip() in {"paper_like_full_text", "paper_like_sections"}
+        ),
+        "metadata_page_section_papers": sum(
+            1
+            for paper in high_weight_papers
+            if str((paper.get("full_text_status") or {}).get("quality", "")).strip() == "metadata_page_sections"
+        ),
+        "stale_genome_cards": sum(1 for card in genome_cards if bool(card.get("needs_full_text_refresh"))),
+        "stale_pattern_cards": sum(1 for card in pattern_cards if bool(card.get("needs_genome_refresh"))),
     }
     missing = []
     if counts["high_weight_papers"] < 3:
@@ -7453,6 +8641,9 @@ def compute_strict_evidence_readiness(db_path: Path, paper_limit: int) -> Dict[s
         next_commands.append(f"{CLI_CMD} score")
     if counts["strict_genome_cards"] < 2 and counts["high_weight_papers"] >= 2:
         next_commands.append(f"{CLI_CMD} gb --limit 5")
+    if counts["stale_genome_cards"]:
+        refresh_mode = "" if counts["strict_genome_cards"] else " --extractive"
+        next_commands.append(f"{CLI_CMD} gb --refresh-stale{refresh_mode} --limit {min(20, counts['stale_genome_cards'])}")
     if counts["strict_pattern_cards"] < 1 and counts["strict_genome_cards"] >= 2:
         next_commands.append(f"{CLI_CMD} pb --limit 5")
     if status == "ready_for_strict_generation":
@@ -7474,10 +8665,60 @@ def compute_strict_evidence_readiness(db_path: Path, paper_limit: int) -> Dict[s
             "Missing or unmatched citations are rejected before saving."
         ),
         "high_weight_papers": high_weight_papers,
+        "full_text_evidence_policy": (
+            "Full-text sections deepen Genome extraction and evidence audits. "
+            "Gold status still comes only from accepted quality signals; user-library papers remain domain knowledge only."
+        ),
         "genome_cards": genome_cards,
         "pattern_cards": pattern_cards,
     }
     return payload
+
+
+def full_text_status_for_paper(paper: Dict[str, object]) -> Dict[str, object]:
+    payload = sanitize_full_text_payload(parse_json_object(paper.get("full_text_json", "{}")))
+    sections = payload.get("sections") if isinstance(payload, dict) else {}
+    if not isinstance(sections, dict):
+        sections = {}
+    available_sections = [
+        str(section).strip()
+        for section in payload.get("available_sections", [])
+        if str(section).strip()
+    ] if isinstance(payload.get("available_sections"), list) else sorted(
+        key for key, value in sections.items() if str(value).strip()
+    )
+    if available_sections:
+        status = "full_text_sections"
+    elif str(paper.get("abstract", "")).strip():
+        status = "abstract_or_metadata_only"
+    else:
+        status = "metadata_only"
+    quality = str(payload.get("quality", "")).strip() if isinstance(payload, dict) else ""
+    if not quality:
+        full_text_chars = int(payload.get("full_text_chars", 0) or 0) if isinstance(payload, dict) else 0
+        section_set = {str(item).strip() for item in available_sections if str(item).strip()}
+        core = {"introduction", "related_work", "method", "experiments", "limitations", "conclusion"}
+        has_problem_setup = bool(section_set & {"introduction", "related_work"})
+        has_evidence_story = bool(section_set & {"experiments", "limitations", "conclusion"})
+        if len(section_set & core) >= 5 and has_problem_setup and has_evidence_story:
+            quality = "paper_like_sections"
+        elif full_text_chars >= 8000 and len(section_set & core) >= 3 and has_problem_setup:
+            quality = "paper_like_full_text"
+        elif full_text_chars >= 4000 and len(section_set & core) >= 3 and (has_problem_setup or has_evidence_story):
+            quality = "paper_like_sections"
+        elif available_sections:
+            quality = "metadata_page_sections"
+        else:
+            quality = "no_sections"
+    return {
+        "status": status,
+        "quality": quality,
+        "section_count": len(available_sections),
+        "available_sections": available_sections,
+        "full_text_chars": int(payload.get("full_text_chars", 0) or 0) if isinstance(payload, dict) else 0,
+        "source_url": str(payload.get("source_url", "")).strip() if isinstance(payload, dict) else "",
+        "parser_hint": str(payload.get("parser_hint", "")).strip() if isinstance(payload, dict) else "",
+    }
 
 
 def build_evidence_report(root_dir: Path, paper_limit: int) -> Tuple[Dict[str, object], Path, Path]:
@@ -8488,6 +9729,15 @@ def render_evidence_report_markdown(payload: Dict[str, object]) -> str:
         f"- pattern_cards: {counts.get('pattern_cards', 0)}",
         f"- strict_genome_cards: {counts.get('strict_genome_cards', 0)}",
         f"- strict_pattern_cards: {counts.get('strict_pattern_cards', 0)}",
+        f"- full_text_ready_papers: {counts.get('full_text_ready_papers', 0)}",
+        f"- paper_like_full_text_papers: {counts.get('paper_like_full_text_papers', 0)}",
+        f"- metadata_page_section_papers: {counts.get('metadata_page_section_papers', 0)}",
+        f"- abstract_only_papers: {counts.get('abstract_only_papers', 0)}",
+        f"- stale_genome_cards: {counts.get('stale_genome_cards', 0)}",
+        f"- stale_pattern_cards: {counts.get('stale_pattern_cards', 0)}",
+        "",
+        "## Full-Text Evidence Policy",
+        str(payload.get("full_text_evidence_policy", "")).strip(),
         "",
         "## Strict Generation Requirement",
         str(payload.get("strict_generation_requirement", "")).strip(),
@@ -8505,9 +9755,16 @@ def render_evidence_report_markdown(payload: Dict[str, object]) -> str:
         for paper in papers:
             if not isinstance(paper, dict):
                 continue
+            full_text = paper.get("full_text_status", {})
+            if not isinstance(full_text, dict):
+                full_text = {}
+            section_count = full_text.get("section_count", 0)
+            full_text_status = str(full_text.get("status", "")).strip() or "unknown"
+            full_text_quality = str(full_text.get("quality", "")).strip() or "unknown"
             lines.append(
                 f"- [{paper.get('paper_id')}] score={paper.get('paper_weight')} "
-                f"{paper.get('year')} {paper.get('venue')} {paper.get('quality_signal')}: {paper.get('title')}"
+                f"{paper.get('year')} {paper.get('venue')} {paper.get('quality_signal')} "
+                f"full_text={full_text_status}:{full_text_quality}:{section_count}: {paper.get('title')}"
             )
     else:
         lines.append("- None.")
@@ -8517,7 +9774,11 @@ def render_evidence_report_markdown(payload: Dict[str, object]) -> str:
         for card in genomes:
             if not isinstance(card, dict):
                 continue
-            lines.append(f"- [{card.get('card_id')}] paper={card.get('paper_id')} {card.get('title')}")
+            refresh = " stale_full_text_refresh" if card.get("needs_full_text_refresh") else ""
+            lines.append(
+                f"- [{card.get('card_id')}] paper={card.get('paper_id')} "
+                f"evidence={card.get('evidence_level')}{refresh}: {card.get('title')}"
+            )
     else:
         lines.append("- None.")
     lines.extend(["", "## Pattern Cards"])
@@ -8526,7 +9787,8 @@ def render_evidence_report_markdown(payload: Dict[str, object]) -> str:
         for card in patterns:
             if not isinstance(card, dict):
                 continue
-            lines.append(f"- [{card.get('card_id')}] {card.get('pattern_key')} :: {card.get('pattern_name')}")
+            refresh = " stale_genome_dependency" if card.get("needs_genome_refresh") else ""
+            lines.append(f"- [{card.get('card_id')}] {card.get('pattern_key')}{refresh} :: {card.get('pattern_name')}")
     else:
         lines.append("- None.")
     lines.extend(["", "## Next Commands"])
@@ -9200,6 +10462,9 @@ def build_candidate_dossier_payload(*, idea_id: int, query: str, payload: Dict[s
         "novelty_claim": str(payload.get("novelty", "")).strip(),
         "paper_story_hook": str(payload.get("paper_angle", "")).strip(),
         "evaluation_sketch": str(payload.get("evaluation_outline", "")).strip(),
+        "idea_evaluation_protocol": payload.get("idea_evaluation_protocol", {})
+        if isinstance(payload.get("idea_evaluation_protocol"), dict)
+        else {},
         "why_now": str(payload.get("why_now", "")).strip(),
         "frontier_gap": str(payload.get("frontier_gap", "")).strip(),
         "generation_guardrail": str(payload.get("generation_guardrail", "")).strip(),
@@ -9450,6 +10715,8 @@ def build_prior_art_check(session_context: Dict[str, object]) -> str:
     label = str(session_context.get("prior_art_label", "")).strip()
     summary = str(session_context.get("prior_art_summary", "")).strip()
     note = str(session_context.get("differentiation_note", "")).strip()
+    novelty_boundary = str(session_context.get("novelty_boundary", "")).strip()
+    renamed_only_risk = str(session_context.get("renamed_only_risk", "")).strip()
     pieces = []
     if gate_decision:
         pieces.append(f"Prior-art expert gate: {gate_decision}.")
@@ -9459,6 +10726,10 @@ def build_prior_art_check(session_context: Dict[str, object]) -> str:
         pieces.append("Why not done yet: " + " ".join(str(item).strip() for item in why_not_done[:3] if str(item).strip()))
     if isinstance(required_diff, list) and required_diff:
         pieces.append("Required differentiation: " + " ".join(str(item).strip() for item in required_diff[:3] if str(item).strip()))
+    if novelty_boundary:
+        pieces.append("Novelty boundary: " + novelty_boundary)
+    if renamed_only_risk:
+        pieces.append(f"Renamed-only risk: {renamed_only_risk}.")
     if label:
         pieces.append(f"Local prior-art screen: {label}.")
     if summary:
@@ -9647,6 +10918,7 @@ def render_candidate_dossier_markdown(dossier: Dict[str, object]) -> str:
     basis_lines = render_evidence_basis_lines(dossier.get("evidence_basis", []))
     audit_lines = render_generation_evidence_audit_lines(dossier.get("generation_evidence_audit", {}))
     storyline_lines = render_storyline_trace_lines(dossier.get("storyline_trace", {}))
+    protocol_lines = render_idea_evaluation_protocol_lines(dossier.get("idea_evaluation_protocol", {}))
 
     sections = [
         f"# {str(dossier.get('title', '')).strip() or str(dossier.get('one_line_idea', '')).strip()}",
@@ -9678,6 +10950,9 @@ def render_candidate_dossier_markdown(dossier: Dict[str, object]) -> str:
         "## Prior-Art Check",
         str(dossier.get("prior_art_check", "")).strip(),
         "",
+        "## Idea Evaluation Protocol",
+        *(protocol_lines or ["No idea evaluation protocol captured."]),
+        "",
         "## Feasibility",
         str(dossier.get("feasibility", "")).strip(),
         "",
@@ -9705,6 +10980,29 @@ def render_candidate_dossier_markdown(dossier: Dict[str, object]) -> str:
         str(dossier.get("paper_story_hook", "")).strip(),
     ]
     return "\n".join(sections).strip() + "\n"
+
+
+def render_idea_evaluation_protocol_lines(value: object) -> List[str]:
+    if not isinstance(value, dict):
+        return []
+    lines = []
+    purpose = str(value.get("purpose", "")).strip()
+    if purpose:
+        lines.append(f"- Purpose: {purpose}")
+    dimensions = value.get("dimensions", [])
+    if isinstance(dimensions, list):
+        for item in dimensions[:10]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            question = str(item.get("question", "")).strip()
+            pass_condition = str(item.get("pass_condition", "")).strip()
+            if name or question or pass_condition:
+                lines.append(f"- {name}: {question} Pass: {pass_condition}".strip())
+    reject_if = value.get("reject_if", [])
+    if isinstance(reject_if, list) and reject_if:
+        lines.append("- Reject if: " + " ".join(str(item).strip() for item in reject_if[:3] if str(item).strip()))
+    return lines
 
 
 def render_storyline_trace_lines(value: object) -> List[str]:
@@ -9747,9 +11045,13 @@ def render_evidence_basis_lines(value: object) -> List[str]:
         source = str(item.get("source_id", "")).strip() or "unknown"
         source_type = str(item.get("source_type", "")).strip() or "evidence"
         quality = str(item.get("quality_signal", "")).strip() or "stored"
+        depth = item.get("matched_evidence_depth") or item.get("evidence_depth")
+        depth_note = ""
+        if isinstance(depth, dict) and str(depth.get("status", "")).strip():
+            depth_note = f", depth={depth.get('status')}:{depth.get('section_count', 0)}"
         standard = str(item.get("borrowed_standard", "")).strip()
         used_for = str(item.get("used_for", "")).strip()
-        line = f"- {source_type}:{source} ({quality})"
+        line = f"- {source_type}:{source} ({quality}{depth_note})"
         if used_for:
             line += f" -> {used_for}"
         if standard:
@@ -9768,6 +11070,7 @@ def render_generation_evidence_audit_lines(value: object) -> List[str]:
         f"- covered_uses: {', '.join(str(item) for item in value.get('covered_uses', []) or [])}",
         f"- missing_uses: {', '.join(str(item) for item in value.get('missing_uses', []) or [])}",
         f"- score_penalty: {value.get('penalty', 0.0)}",
+        f"- evidence_depth: {str((value.get('evidence_depth') or {}).get('status', '')).strip() if isinstance(value.get('evidence_depth'), dict) else ''}",
         f"- requirement: {str(value.get('requirement', '')).strip()}",
     ]
 
@@ -9778,6 +11081,7 @@ def render_evidence_score_lines(value: Dict[str, object]) -> List[str]:
     lines = [
         f"- total: {value.get('total', 0.0)}/{value.get('scale', '0-10')}",
         f"- rubric_source: {str(value.get('rubric_source', '')).strip()}",
+        f"- evidence_depth: {str((value.get('evidence_depth') or {}).get('status', '')).strip() if isinstance(value.get('evidence_depth'), dict) else ''} adjustment={value.get('evidence_depth_adjustment', 0.0)}",
     ]
     dimensions = value.get("dimensions", {})
     if isinstance(dimensions, dict):

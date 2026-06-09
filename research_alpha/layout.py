@@ -121,13 +121,20 @@ def write_local_ra_wrapper(root_dir: Path) -> None:
         return
     module_search_root = Path(__file__).resolve().parent.parent
     wrapper_text = (
-        "#!/usr/bin/env python3\n\n"
-        "import sys\n"
-        "from pathlib import Path\n\n"
-        f"sys.path.insert(0, {str(module_search_root)!r})\n\n"
-        "from research_alpha.cli import main\n\n\n"
-        "if __name__ == \"__main__\":\n"
-        "    raise SystemExit(main())\n"
+        "#!/usr/bin/env bash\n\n"
+        "set -euo pipefail\n\n"
+        "script_dir=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n"
+        f"export PYTHONPATH={str(module_search_root)!r}:\"${{PYTHONPATH:-}}\"\n\n"
+        "if [[ -z \"${RA_BOOTSTRAPPED:-}\" ]]; then\n"
+        "  export RA_BOOTSTRAPPED=1\n"
+        "  if [[ -x \"$script_dir/.venv/bin/python\" ]]; then\n"
+        "    exec \"$script_dir/.venv/bin/python\" -c 'from research_alpha.cli import main; raise SystemExit(main())' \"$@\"\n"
+        "  fi\n"
+        "  if command -v uv >/dev/null 2>&1; then\n"
+        f"    exec uv --project {str(module_search_root)!r} run python -c 'from research_alpha.cli import main; raise SystemExit(main())' \"$@\"\n"
+        "  fi\n"
+        "fi\n\n"
+        "exec python3 -c 'from research_alpha.cli import main; raise SystemExit(main())' \"$@\"\n"
     )
     wrapper_path.write_text(wrapper_text, encoding="utf-8")
     current_mode = wrapper_path.stat().st_mode

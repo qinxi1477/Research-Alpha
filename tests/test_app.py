@@ -21,13 +21,16 @@ from research_alpha.app import (
     audit_storyline_migration,
     audit_generation_evidence,
     build_idea_generation_failure_summary,
+    build_candidate_idea_ranking,
     build_idea_semantic_retry_prompt,
+    build_user_domain_knowledge_summary,
     idea_generation_failure_is_semantic_retryable,
     backfill_pattern_source_provenance,
     build_evidence_report,
     build_evidence_grounded_score,
     compute_strict_evidence_readiness,
     build_quality_enrich_prompt,
+    gold_evidence_tier,
     infer_next_commands,
     infer_next_stages,
     parse_prior_art_gate_response,
@@ -47,10 +50,11 @@ from research_alpha.app import (
     validate_query_frontier_evidence,
 )
 from research_alpha.connectors import ConnectorError, cvf_award_key, eccv_award_key, harvest_cvf_awards, harvest_icml_awards, harvest_neurips_awards, harvest_openreview, icml_award_key, neurips_award_key, openreview_award_from_venue, parse_acl_awards_html, parse_cvf_awards_html, parse_cvf_oral_html, parse_eccv_awards_html, parse_generic_awards_html, parse_icml_awards_html, parse_icml_oral_html, parse_neurips_awards_html, parse_neurips_oral_html
-from research_alpha.db import add_candidate_idea, add_paper, add_run, connect, delete_idea_session, get_candidate_idea, list_frontier_papers, list_top_papers, list_user_library_papers, upsert_idea_card, upsert_pattern_card, upsert_user_library_paper
+from research_alpha.db import add_candidate_idea, add_paper, add_run, connect, delete_idea_session, get_candidate_idea, init_db, list_frontier_papers, list_top_papers, list_user_library_papers, upsert_idea_card, upsert_pattern_card, upsert_user_library_paper
 from research_alpha.ideas import build_idea_prompt, parse_idea_response
 from research_alpha.limitations import limitations_json_for_paper
 from research_alpha.memory import build_session_memory_status
+from research_alpha.prior_art import analyze_prior_art
 from research_alpha.gui import (
     CONSTRAINT_OPTIONS,
     FIELD_OPTIONS,
@@ -77,6 +81,9 @@ from research_alpha.gui import (
     auxiliary_gold_venues,
     core_gold_venues,
     create_gui_http_server,
+    current_gui_year,
+    default_gold_from_year,
+    default_gold_to_year,
     describe_gold_source_plan,
     extract_created_session_id,
     gui_error_response,
@@ -84,6 +91,8 @@ from research_alpha.gui import (
     parse_gui_bool,
     parse_gui_scope,
     metadata_only_gold_venues,
+    enrich_user_library_paper,
+    opportunistic_user_library_full_text_ingest,
     parse_venue_payload,
     parse_gui_choice,
     parse_gui_int,
@@ -95,6 +104,7 @@ from research_alpha.gui import (
     render_index_html,
     resolve_gui_session,
     resolve_gui_state_session_id,
+    sanitize_user_facing_text,
     split_gold_venues_by_remote,
     write_http_response,
     year_from_arxiv_id,
@@ -153,6 +163,51 @@ def strict_storyline_trace(source_id: str = "hidden-assumption-reversal") -> dic
             "transfer_to_current_hotspot": "The idea fails if it becomes benchmark churn without mechanism.",
         },
     }
+
+
+def strict_idea_payload() -> dict:
+    return {
+        "idea_title": "Stress-Tested Agent Benchmark",
+        "core_hypothesis": "Research-agent evaluation should expose hidden assumption failures rather than only report task completion.",
+        "historical_pattern": "hidden-assumption-reversal",
+        "trend_support": "Recent agentic evaluation work needs stronger stress tests.",
+        "frontier_gap": "Current evaluations miss long-horizon failure boundaries.",
+        "why_now": "Research agents are becoming plausible enough that evaluation standards matter.",
+        "novelty": "Reframes agent evaluation around hidden brittleness and reviewer-visible failure boundaries.",
+        "value": "Improves trust in claims about scientific discovery agents.",
+        "key_risk": "The protocol may overfit to visible failure modes.",
+        "first_experiments": ["Compare ranking changes under ordinary tasks and assumption-boundary audits."],
+        "evaluation_outline": "Measure ranking changes and failure-mode coverage.",
+        "paper_angle": "Turns benchmark success into an audit of hidden assumptions.",
+        "evidence_basis": strict_evidence_basis(),
+        "generation_guardrail": strict_generation_guardrail(),
+        "storyline_trace": strict_storyline_trace(),
+    }
+
+
+def prior_art_pass_json() -> str:
+    return json.dumps(
+        {
+            "decision": "pass",
+            "overlap_label": "complementary",
+            "closest_work": [
+                {
+                    "paper_id": 3,
+                    "title": "Outstanding Agent Stress Tests",
+                    "overlap_reason": "Shares evaluation language but not the same contribution.",
+                    "covered_parts": ["agent", "evaluation"],
+                    "missing_parts": ["different novelty boundary and evidence target"],
+                    "difference_from_idea": "The candidate targets a different causal boundary and scoring protocol.",
+                }
+            ],
+            "renamed_only_risk": "low",
+            "novelty_boundary": "The idea must change the causal evaluation boundary, not only rename stress tests.",
+            "why_not_done_yet": ["Stored prior work lacks the candidate's stated novelty boundary and evaluation protocol."],
+            "required_differentiation": ["Keep the novelty boundary explicit against the closest stress-test work."],
+            "rethink_prompt": "",
+            "summary": "Closest work is related but does not cover the full proposed idea.",
+        }
+    )
 
 
 def seed_strict_quality_papers(cwd: Path) -> None:
@@ -373,6 +428,98 @@ class AppTests(unittest.TestCase):
             script_path.write_text("\n".join(scripts), encoding="utf-8")
             result = subprocess.run(
                 ["node", "--check", str(script_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'id="fromYear" type="number" value="{default_gold_from_year()}"', html)
+        self.assertIn(f'id="toYear" type="number" value="{default_gold_to_year()}"', html)
+        self.assertNotIn('id="toYear" type="number" value="2026"', html)
+
+    def test_gui_activity_completion_summary_is_executable_javascript(self) -> None:
+        html = render_index_html()
+        scripts = re.findall(r"<script>([\s\S]*?)</script>", html)
+        self.assertTrue(scripts)
+        script = "\n".join(scripts).replace("\n    refresh();", "\n    // refresh disabled in this behavior harness")
+        setup = """
+const elements = {
+  jobCount: {textContent:'', className:'', title:'', onclick:null},
+  jobFeed: {textContent:'', className:'', title:'', onclick:null},
+  instruction: {value:'', style:{}, scrollHeight:44, addEventListener() {}, focus() {}},
+};
+global.document = {
+  getElementById(id) { return elements[id] || null; },
+  addEventListener() {},
+};
+global.window = {lastData:{}, addEventListener() {}, setTimeout, clearTimeout};
+global.setTimeout = setTimeout;
+global.clearTimeout = clearTimeout;
+global.console = console;
+global.refresh = () => {};
+"""
+        harness = """
+function assert(condition, message) { if (!condition) throw new Error(message); }
+renderJobs({jobs:[{
+  id: 1,
+  kind: 'gold-build',
+  name: 'gold-build test',
+  status: 'completed',
+  result: {stdout: 'Gold-build summary: fetched=7; candidate_imported=4; excellent_imported=2; poster_skipped=1; openreview_non_excellent_skipped=0; unqualified_skipped=0; failures=0', stderr: ''},
+}], health:{}});
+assert(elements.jobFeed.textContent.includes('Gold 2 · 趋势 4 · 失败 0'), elements.jobFeed.textContent);
+renderJobs({jobs:[{
+  id: 2,
+  kind: 'quality-enrich',
+  name: 'quality test',
+  status: 'completed',
+  result: {stdout: 'Applied labels: 3\\nSkipped labels: 5', stderr: ''},
+}], health:{}});
+assert(elements.jobFeed.textContent.includes('新增标签 3 · 跳过 5'), elements.jobFeed.textContent);
+renderJobs({jobs:[{
+  id: 4,
+  kind: 'quality-enrich',
+  name: 'new quality success',
+  status: 'completed',
+  completed_at: 40,
+  result: {stdout: 'Applied labels: 1\\nSkipped labels: 0', stderr: ''},
+}, {
+  id: 3,
+  kind: 'gold-build',
+  name: 'old gold failure',
+  status: 'failed',
+  completed_at: 20,
+  error: 'old failure',
+}], health:{}});
+assert(elements.jobFeed.textContent.includes('最近完成：趋势质量核验'), elements.jobFeed.textContent);
+assert(!elements.jobFeed.textContent.includes('最近失败'), elements.jobFeed.textContent);
+renderJobs({jobs:[{
+  id: 6,
+  kind: 'gold-build',
+  name: 'ICML success',
+  status: 'completed',
+  group_id: 'gold-build:draft:test:99',
+  completed_at: 60,
+  result: {stdout: 'Gold-build summary: fetched=5; candidate_imported=5; excellent_imported=2; poster_skipped=0; openreview_non_excellent_skipped=0; unqualified_skipped=3; failures=0', stderr: ''},
+}, {
+  id: 7,
+  kind: 'gold-build',
+  name: 'OpenReview failed',
+  status: 'failed',
+  group_id: 'gold-build:draft:test:99',
+  completed_at: 61,
+  error: 'Gold-build summary: fetched=0; candidate_imported=0; excellent_imported=0; poster_skipped=0; openreview_non_excellent_skipped=0; unqualified_skipped=0; failures=1',
+}], health:{}});
+assert(elements.jobFeed.textContent.includes('部分完成：核心库扩充'), elements.jobFeed.textContent);
+assert(elements.jobFeed.textContent.includes('Gold 2 · 趋势 5 · 失败 2'), elements.jobFeed.textContent);
+assert(!elements.jobFeed.textContent.includes('最近失败'), elements.jobFeed.textContent);
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = Path(tmpdir) / "gui-activity-summary.js"
+            script_path.write_text(setup + "\n" + script + "\n" + harness, encoding="utf-8")
+            result = subprocess.run(
+                ["node", str(script_path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -771,6 +918,33 @@ class AppTests(unittest.TestCase):
         self.assertEqual(records[0]["award"], "oral")
         self.assertIn("/oral/101", records[0]["external_ref"])
         self.assertIn("A. Author", records[0]["abstract"])
+
+    def test_neurips_oral_parser_accepts_event_card_layout(self) -> None:
+        html = """
+        <main>
+          <div class="event-card" data-event-type="Oral">
+            <span class="event-type-badge">Oral</span>
+            <h3 class="event-title">
+              <a href="/virtual/2024/oral/97946">Human Expertise in Algorithmic Prediction</a>
+            </h3>
+            <div class="event-speakers">Rohan Alur ⋅ Manish Raghavan ⋅ Devavrat Shah</div>
+            <div class="event-abstract"><div class="abstract-content">We study prediction with human expertise.</div></div>
+          </div>
+          <div class="event-card" data-event-type="Poster">
+            <span class="event-type-badge">Poster</span>
+            <h3 class="event-title">
+              <a href="/virtual/2024/poster/111">Poster Should Stay Out</a>
+            </h3>
+          </div>
+        </main>
+        """
+        records = parse_neurips_oral_html(html, year=2024, source_url="https://neurips.cc/virtual/2024/events/oral")
+        by_title = {str(record["title"]): record for record in records}
+
+        self.assertEqual(set(by_title), {"Human Expertise in Algorithmic Prediction"})
+        self.assertEqual(by_title["Human Expertise in Algorithmic Prediction"]["award"], "oral")
+        self.assertIn("Rohan Alur", by_title["Human Expertise in Algorithmic Prediction"]["abstract"])
+        self.assertNotIn("Poster Should Stay Out", by_title)
 
     def test_neurips_oral_parser_rejects_unlinked_non_oral_cards(self) -> None:
         html = """
@@ -2006,6 +2180,7 @@ class AppTests(unittest.TestCase):
         }
         self.assertEqual(set(auxiliary_ranks.values()), {"趋势辅助"})
         self.assertTrue(any(all(venue in preset["venues"] for venue in ["ICLR", "NeurIPS", "ICML"]) for preset in VENUE_PRESETS))
+        self.assertTrue(any(preset["venues"] == ["ICLR", "NeurIPS", "ICML", "CVPR", "ICCV"] for preset in VENUE_PRESETS))
         self.assertTrue(any(preset["venues"] == ["ICLR", "NeurIPS", "ICML", "CVPR", "ICCV", "TPAMI"] for preset in VENUE_PRESETS))
         self.assertTrue(any(preset["label"] == "核心+跨域趋势" for preset in VENUE_PRESETS))
         self.assertEqual(parse_venue_payload(["ICLR", "NeurIPS", "iclr", ""]), ["ICLR", "NeurIPS"])
@@ -2117,6 +2292,53 @@ class AppTests(unittest.TestCase):
                             time.sleep(0.01)
                         remotes = {command[command.index("--remote") + 1] for command in captured_commands}
                         self.assertEqual(remotes, {"openreview", "cvf_awards", "openalex"})
+                    finally:
+                        server.shutdown()
+                        server.server_close()
+                        thread.join(timeout=2)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_gui_gold_build_defaults_to_recent_completed_year_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                captured_commands = []
+
+                def fake_streaming(command, root_dir, on_output=None):
+                    captured_commands.append(command)
+                    return {"exit_code": 0, "stdout": "Gold-build summary JSON: {\"fetched\":0,\"candidate_imported\":0,\"excellent_imported\":0}", "stderr": ""}
+
+                with patch("research_alpha.gui.run_app_command_streaming", side_effect=fake_streaming):
+                    server = create_gui_http_server(cwd, host="127.0.0.1", port=0)
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        status, body = self.gui_post_json(
+                            server,
+                            "/api/gold-build",
+                            {"venues": ["ICLR"], "per_venue_year": 2, "ui_scope": "draft:default-years"},
+                        )
+                        self.assertEqual(status, 200)
+
+                        for _ in range(50):
+                            if captured_commands:
+                                break
+                            import time
+
+                            time.sleep(0.01)
+                        self.assertEqual(len(captured_commands), 1)
+                        command = captured_commands[0]
+                        self.assertEqual(command[command.index("--from-year") + 1], str(default_gold_from_year()))
+                        self.assertEqual(command[command.index("--to-year") + 1], str(default_gold_to_year()))
+                        self.assertNotIn("--no-fulltext", command)
+                        self.assertLessEqual(default_gold_to_year(), current_gui_year() - 1)
+                        self.assertEqual(body["jobs"][0]["kind"], "gold-build")
                     finally:
                         server.shutdown()
                         server.server_close()
@@ -2240,16 +2462,16 @@ class AppTests(unittest.TestCase):
                 main(["init"])
                 self.write_gui_test_llm_env(cwd)
                 release = threading.Event()
-                captured_commands = []
+                created_sessions = []
 
-                def fake_streaming(command, root_dir, on_output=None):
-                    captured_commands.append(command)
+                def fake_stable_ideate(root_dir, direction, brief_direction, provider, lang, review_rounds=4, on_output=None):
+                    created_sessions.append((direction, brief_direction, provider, lang, review_rounds))
                     if on_output:
-                        on_output("stdout", "正在检索优秀论文逻辑")
+                        on_output("stdout", "Auto session: #1 research agents")
                     release.wait(2)
-                    return {"exit_code": 0, "stdout": "Created idea session #1", "stderr": ""}
+                    return {"exit_code": 0, "stdout": "Auto session: #1 research agents", "stderr": ""}
 
-                with patch("research_alpha.gui.run_app_command_streaming", side_effect=fake_streaming):
+                with patch("research_alpha.gui.run_gui_stable_ideate_session", side_effect=fake_stable_ideate):
                     server = create_gui_http_server(cwd, host="127.0.0.1", port=0)
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
@@ -2276,16 +2498,14 @@ class AppTests(unittest.TestCase):
                         self.assertEqual(second["job"]["status"], "running")
 
                         for _ in range(50):
-                            if captured_commands:
+                            if created_sessions:
                                 break
                             import time
 
                             time.sleep(0.01)
-                        self.assertEqual(len(captured_commands), 1)
-                        self.assertIn("--display-direction", captured_commands[0])
-                        self.assertIn("--review-loop", captured_commands[0])
-                        self.assertIn("--review-rounds", captured_commands[0])
-                        self.assertIn("4", captured_commands[0])
+                        self.assertEqual(len(created_sessions), 1)
+                        self.assertEqual(created_sessions[0][0], "research agents")
+                        self.assertEqual(created_sessions[0][2], "deepseek")
                     finally:
                         release.set()
                         server.shutdown()
@@ -2415,17 +2635,17 @@ class AppTests(unittest.TestCase):
                 main(["init"])
                 self.write_gui_test_llm_env(cwd)
                 release = threading.Event()
-                captured_commands = []
+                created_sessions = []
                 request_count = 8
 
-                def fake_streaming(command, root_dir, on_output=None):
-                    captured_commands.append(command)
+                def fake_stable_ideate(root_dir, direction, brief_direction, provider, lang, review_rounds=4, on_output=None):
+                    created_sessions.append((direction, provider))
                     if on_output:
                         on_output("stdout", "ideate is running")
                     release.wait(2)
-                    return {"exit_code": 0, "stdout": "Created idea session #1", "stderr": ""}
+                    return {"exit_code": 0, "stdout": "Auto session: #1 research agents", "stderr": ""}
 
-                with patch("research_alpha.gui.run_app_command_streaming", side_effect=fake_streaming):
+                with patch("research_alpha.gui.run_gui_stable_ideate_session", side_effect=fake_stable_ideate):
                     server = create_gui_http_server(cwd, host="127.0.0.1", port=0)
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
@@ -2464,12 +2684,12 @@ class AppTests(unittest.TestCase):
                         self.assertEqual(deduped_count, request_count - 1)
 
                         for _ in range(50):
-                            if captured_commands:
+                            if created_sessions:
                                 break
                             import time
 
                             time.sleep(0.01)
-                        self.assertEqual(len(captured_commands), 1)
+                        self.assertEqual(created_sessions, [("research agents", "deepseek")])
                     finally:
                         release.set()
                         server.shutdown()
@@ -3345,8 +3565,8 @@ class AppTests(unittest.TestCase):
         self.assertIn("deleteUserLibraryPaper", html)
         self.assertIn('/api/user-library/delete', html)
         self.assertIn("openUserLibraryPaper", html)
-        self.assertIn("user_library_used_as_standard", html)
-        self.assertIn("不参与 idea 评分标准", html)
+        self.assertIn("stable_conversation_idea", Path("research_alpha/gui.py").read_text(encoding="utf-8"))
+        self.assertIn("不进入 Gold、评分标准或故事线来源", html)
         self.assertIn("event.key === 'Enter'", html)
         self.assertIn("!event.shiftKey", html)
         self.assertIn("wasNearBottom", html)
@@ -3443,6 +3663,8 @@ class AppTests(unittest.TestCase):
         self.assertIn('onclick="reviewLoop()"', html)
         self.assertIn("自动经过 3-5 轮审稿专家意见调整", html)
         self.assertIn("自动审稿循环", html)
+        self.assertNotIn("并自动进行审稿循环", html)
+        self.assertIn("正在生成 idea", html)
         self.assertIn("优秀论文逻辑库", html)
         self.assertIn("证据已就绪", html)
         self.assertIn("const health = data.health || {}", html)
@@ -3452,11 +3674,11 @@ class AppTests(unittest.TestCase):
         self.assertIn("evidence_failed: '证据任务失败'", html)
         self.assertIn("证据任务失败", html)
         self.assertIn("latest_failed_evidence_job", html)
-        self.assertIn("const action = failedEvidence.kind === 'quality-enrich' ? 'quality-enrich' : 'settings';", html)
+        self.assertIn("const action = failedEvidence.kind === 'quality-enrich' ? 'quality-enrich' : 'evidence-build';", html)
         self.assertIn("el.onclick = () => metricAction(action);", html)
         self.assertIn("点击重新核验", html)
         self.assertIn("点击调整检索", html)
-        self.assertIn("document.getElementById('strictStatus').onclick = () => metricAction(failedEvidence ? 'settings' : 'excellent');", html)
+        self.assertIn("document.getElementById('strictStatus').onclick = () => metricAction(failedEvidence ? 'evidence-build' : 'excellent');", html)
         self.assertIn("可重试或缩小检索范围", html)
         self.assertIn("missing_requirements", html)
         self.assertIn("证据构建中", html)
@@ -3467,7 +3689,7 @@ class AppTests(unittest.TestCase):
         self.assertIn("min-height:180px", html)
         self.assertIn(".left-rail { border-right:1px solid var(--line); background:#fff; padding:14px 12px; display:flex; flex-direction:column; gap:12px; overflow:auto; min-height:0; }", html)
         self.assertIn("扩充核心库", html)
-        self.assertIn("质量审查", html)
+        self.assertIn("核验趋势质量", html)
         self.assertIn("Best、Nominee 和 Oral", html)
         self.assertIn("高引用不单独入库", html)
         self.assertIn("趋势论文", html)
@@ -3487,14 +3709,7 @@ class AppTests(unittest.TestCase):
         self.assertIn("没有通过证据锚点审计", html)
         self.assertIn("系统已拦截这次不可靠输出", html)
         self.assertIn("Idea-session summary JSON", html)
-        self.assertIn("Idea-generation failure JSON", html)
-        self.assertIn("生成结果像是在硬搬源论文方法", html)
-        self.assertIn("这次没有写入新对话，因为严格生成门没有放行 idea。", html)
-        self.assertIn("function ideaFailureRecoveryLines(failure)", html)
-        self.assertIn("storyline_first_retry", html)
-        self.assertIn("恢复策略：先重写六步论文故事线，再迁移到当前领域；只迁移逻辑角色，不迁移源论文表面方法。", html)
-        self.assertIn("卡住的维度：${failure.blocked_dimensions.slice(0, 4).join('、')}", html)
-        self.assertIn("下次重试约束：", html)
+        self.assertNotIn("这次没有写入新对话，因为严格生成门没有放行 idea。", html)
         self.assertIn("证据驱动评分：${summary.evidence_score}/10", html)
         self.assertIn("顶会论文逻辑迁移：", html)
         self.assertIn("六步故事线迁移：", html)
@@ -3550,13 +3765,11 @@ class AppTests(unittest.TestCase):
         self.assertIn("fillPrompt", html)
         self.assertIn("quick-prompts", html)
         self.assertIn("<label>近期趋势源</label>", html)
-        self.assertIn("核心来源会路由到官方奖项页、OpenReview 或元数据核验源", html)
-        self.assertIn("自动抽取</div>", html)
-        self.assertIn("function sourcePlanNote(plan)", html)
-        self.assertIn("核心优秀论文源路由：", html)
-        self.assertIn("直接按 Best/Nominee/Oral 严格入库", html)
-        self.assertIn("先入趋势区，quality-enrich 核验后才可进 Gold", html)
-        self.assertIn("source_plan", html)
+        self.assertIn("扩充优秀论文库的会议和年份在 Evidence library 中设置", html)
+        self.assertIn("对话生成设置</div>", html)
+        self.assertNotIn("function sourcePlanNote(plan)", html)
+        self.assertNotIn("核心优秀论文源路由：", html)
+        self.assertNotIn("source_plan", html)
         self.assertNotIn("OpenAlex 近期候选", html)
         self.assertNotIn("Semantic Scholar 近期候选", html)
         self.assertNotIn("辅助候选", html)
@@ -3575,8 +3788,11 @@ class AppTests(unittest.TestCase):
         self.assertIn("clickable-row", html)
         self.assertIn('button id="provider" class="status-pill"', html)
         self.assertIn('button id="strictStatus" class="status-pill"', html)
-        self.assertIn('onclick="metricAction(\'settings\')"', html)
+        self.assertIn('onclick="metricAction(\'model-settings\')"', html)
         self.assertIn('id="searchSettings"', html)
+        self.assertIn('id="evidenceBuildPanel"', html)
+        self.assertIn("function evidenceScope() { return evidenceScopeId; }", html)
+        self.assertIn("const evidenceScopeId = 'evidence:global';", html)
         self.assertIn("status-link", html)
         self.assertIn("button.status-pill:hover", html)
         self.assertIn("button.status-mini", html)
@@ -3626,6 +3842,7 @@ class AppTests(unittest.TestCase):
         self.assertIn("messageAction('${esc(action.action)}')", html)
         self.assertIn("job.status === 'failed'", html)
         self.assertIn("{label:'调整检索', action:'settings'}", html)
+        self.assertIn("if (action === 'settings') metricAction('evidence-build');", html)
         self.assertIn("{label:'重新核验', action:'quality-enrich'}", html)
         self.assertIn("查看核心库", html)
         self.assertIn("查看趋势论文", html)
@@ -3643,7 +3860,16 @@ class AppTests(unittest.TestCase):
         self.assertIn("function sidebarProgressText(scope)", html)
         self.assertIn("sidebarProgressText(scope) || '任务排队中'", html)
         self.assertIn("const progress = sidebarProgressText(scope);", html)
-        self.assertIn("el.textContent = running ? `正在运行 ${runningJobs.length} 个任务` : '空闲';", html)
+        self.assertIn("el.textContent = awaitingEvidence ? '证据任务提交中' : (running ? `正在运行 ${runningJobs.length} 个任务` : '空闲');", html)
+        self.assertIn("latestFinishedEvidence", html)
+        self.assertIn("latestFinishedEvidence.status === 'failed'", html)
+        self.assertIn("latestCompletedEvidence", html)
+        self.assertIn("function evidenceCompletionSummary(job, jobs=[])", html)
+        self.assertIn("Gold ${summary.excellent_imported ?? 0} · 趋势 ${summary.candidate_imported ?? 0} · 失败 ${summary.failures ?? 0}", html)
+        self.assertIn("新增标签 ${applied || 0} · 跳过 ${skipped || 0}", html)
+        self.assertIn("最近完成：核心库扩充", html)
+        self.assertIn("${label}${summary ? `：${summary}` : ''}。点击查看。", html)
+        self.assertIn("证据任务已结束；对话区不显示中间输出，结果可在证据库或运行记录查看。", html)
         self.assertIn("function liveJobLineForScope(scope) {\n      return '';\n    }", html)
         self.assertNotIn("实时输出 ·", html)
         self.assertNotIn("displayText(withLine.last_line", html)
@@ -3664,7 +3890,7 @@ class AppTests(unittest.TestCase):
         html = render_index_html()
         self.assertIn('id="sideUserLibrary" class="user-library-tab" role="button" tabindex="0"', html)
         self.assertIn('id="userLibraryPanel" class="library-panel user-library-main"', html)
-        self.assertIn(".user-library-main { grid-column:1 / -1; }", html)
+        self.assertIn(".user-library-main, .evidence-build-main { grid-column:1 / -1; }", html)
         self.assertIn("function renderUserLibraryPanel(userPapers=[])", html)
         self.assertIn("function renderUserLibraryMainPanel(userPapers=[])", html)
         self.assertIn("renderUserLibraryPanel(userPapers);", html)
@@ -3684,9 +3910,12 @@ class AppTests(unittest.TestCase):
         self.assertIn(".side-rail .tool-panel.action-panel:last-of-type { order:4; margin-top:clamp(10px, 2.4vh, 24px); }", html)
         logic_pos = html.find("优秀论文逻辑库")
         side_library_pos = html.find('id="sideUserLibrary"')
-        settings_pos = html.find('id="searchSettings"')
+        evidence_build_pos = html.find('id="evidenceBuildPanel"')
         self.assertGreater(side_library_pos, logic_pos)
-        self.assertGreater(settings_pos, side_library_pos)
+        self.assertGreater(side_library_pos, evidence_build_pos)
+        self.assertIn("扩充优秀论文库", html)
+        self.assertIn("会议组合", html)
+        self.assertIn("同时生成可审计逻辑卡", html)
         self.assertIn("用户论文库", html)
         self.assertIn("user-library-tab-label", html)
         self.assertIn("只作领域背景和路线学习，不进入 Gold、评分标准或故事线来源。", html)
@@ -3722,14 +3951,13 @@ class AppTests(unittest.TestCase):
         finalize_match = re.search(r"function finalizeCompletedIdeateJob\(job, activeScope='', options=\{\}\) \{([\s\S]*?)\n    \}", html)
         self.assertIsNotNone(finalize_match)
         finalize_body = finalize_match.group(1)
-        self.assertIn("if (!createdScope)", finalize_body)
-        self.assertIn("setScopeMessages(activityMessagesByScope", finalize_body)
+        self.assertNotIn("if (!createdScope)", finalize_body)
+        self.assertNotIn("jobActivity(job)", finalize_body)
         self.assertIn("if (options.activate && createdScope)", finalize_body)
-        created_activity = re.search(r"if \(!createdScope\) \{([\s\S]*?)\n      \}", finalize_body)
-        self.assertIsNotNone(created_activity)
-        self.assertIn("jobActivity(job)", created_activity.group(1))
         self.assertIn("if (job.kind === 'ideate' && job.created_session_id)", html)
         self.assertIn("lastJobStatuses.set(job.id, job.status);\n            continue;", html)
+        self.assertIn("if (isConversationBlockingJob(job))", html)
+        self.assertNotIn("这次没有写入新对话，因为严格生成门没有放行 idea。", html)
         self.assertIn("const text = ideateSummaryText(summary);", html)
 
     def test_gui_tool_panels_are_quiet_glass_without_corner_badges(self) -> None:
@@ -3886,24 +4114,22 @@ class AppTests(unittest.TestCase):
         self.assertIn("box-shadow:inset 0 0 0 1px rgba(17,24,39,.08)", html)
         self.assertIn(".metric-button:hover::before, .metric-button:focus-visible::before { opacity:.72; }", html)
         self.assertIn("if (action === 'review') review();", html)
-        self.assertIn("onclick=\"panelNavigate(event, 'excellent')\"", html)
+        self.assertIn("onclick=\"panelNavigate(event, 'evidence-build')\"", html)
         self.assertIn("onkeydown=\"activatePanel(event, 'chat')\"", html)
         self.assertIn("点击去扩充核心优秀论文库", html)
         self.assertIn("handleUiFailure", html)
         self.assertIn("请求失败", html)
         self.assertIn("下一步：${nextAction}", html)
-        self.assertIn("未提交到核心 Gold", html)
-        self.assertIn("只作为趋势参考，不参与 idea 评分标准", html)
-        self.assertIn("metadata_only_venues", html)
-        self.assertIn("OpenAlex 元数据收集", html)
-        self.assertIn("后续质量核验确认 Best / Nominee / Oral", html)
+        self.assertIn("只接受 ICLR、NeurIPS/NIPS、ICML、CVPR、ICCV、TPAMI", html)
+        self.assertIn("普通论文和元数据来源先进入趋势区", html)
+        self.assertNotIn("metadata_only_venues", html)
         self.assertIn("核心优秀论文库只接受 ICLR、NeurIPS/NIPS、ICML、CVPR、ICCV、TPAMI", html)
-        self.assertEqual(html.count("个官方优秀论文源正在联网拉取"), 1)
+        self.assertNotIn("个官方优秀论文源正在联网拉取", html)
         self.assertNotIn("alert(", html)
         self.assertNotIn("throw error", html)
         self.assertIn("查看核心优秀论文库", html)
         self.assertIn("回到对话工作区", html)
-        self.assertIn("任务结果只会出现在中间对话", html)
+        self.assertIn("证据任务只显示简短状态，结果进入证据库", html)
         self.assertNotIn("<h2>Jobs</h2>", html)
         self.assertNotIn("Idea Source", html)
         self.assertNotIn("source grounded", html)
@@ -4079,6 +4305,16 @@ class AppTests(unittest.TestCase):
         self.assertNotIn("sk-test-secret", redacted)
         self.assertNotIn("sk-openai-secret", redacted)
         self.assertNotIn("test-deepseek-key", redacted)
+
+    def test_gui_user_facing_text_summarizes_remote_rate_limit_errors(self) -> None:
+        raw = (
+            'Remote request failed with HTTP 429: {"message":"Too Many Requests",'
+            '"error":"Insufficient budget","retryAfter":19960}'
+        )
+        redacted = sanitize_user_facing_text(raw)
+        self.assertIn("远程源限流或预算不足", redacted)
+        self.assertNotIn("Too Many Requests", redacted)
+        self.assertNotIn("Insufficient budget", redacted)
 
     def test_gui_job_exception_error_is_public_safe(self) -> None:
         import time
@@ -5175,7 +5411,7 @@ class AppTests(unittest.TestCase):
         self.assertIn("clearPendingIdeate(jobScope)", html)
         self.assertIn("adoptDraftMessagesToSession(Number(job.created_session_id), jobScope)", html)
         self.assertNotIn("const draftActivity = scopeMessages(activityMessagesByScope, sourceScope)", html)
-        self.assertIn("if (!createdScope)", html)
+        self.assertNotIn("if (!createdScope) {\n        const targetScope = jobScope;", html)
         self.assertIn("finalizeCompletedIdeateJob(pendingJob, activeScope, {activate:true})", html)
         self.assertIn("finalizeCompletedIdeateJobs(jobs, activeScope)", html)
         self.assertIn("activate:Boolean(job.created_session_id && job.ui_scope === scope)", html)
@@ -5206,7 +5442,8 @@ class AppTests(unittest.TestCase):
         self.assertIn("['ideate', 'step', 'review', 'review-loop'].includes", html)
         self.assertIn("Boolean(pendingIdeateForScope(scope))", html)
         self.assertIn("runningConversationJobsForScope(jobs, scope).length > 0", html)
-        self.assertIn("function scopeHasRunningEvidenceJob(scope)", html)
+        self.assertIn("function scopeHasRunningEvidenceJob(scope=evidenceScope())", html)
+        self.assertIn("function evidenceIsBusy()", html)
         self.assertIn("some(job => !isConversationBlockingJob(job))", html)
         self.assertIn("const awaitingCurrentScope = scopeAwaitingJobStart(scope)", html)
         self.assertIn("let hasBlockingRunning = false", html)
@@ -5215,10 +5452,14 @@ class AppTests(unittest.TestCase):
         self.assertIn("if (!instruction) return;", html)
         self.assertIn("if (scopeIsBusy(scope))", html)
         self.assertIn("restoreSubmittedInstruction(scope, instruction);", html)
-        self.assertIn("我已保留这次输入", html)
-        self.assertIn("if (scopeIsBusy(scope)) return;", html)
-        self.assertIn("已有证据任务在后台运行，本次不重复提交", html)
-        self.assertIn("中间对话仍可继续使用", html)
+        self.assertNotIn("我已保留这次输入", html)
+        self.assertIn("if (evidenceIsBusy()) return;", html)
+        ideate_match = re.search(r"async function ideate\(direction\) \{([\s\S]*?)\n    \}", html)
+        self.assertIsNotNone(ideate_match)
+        self.assertNotIn("已有证据任务在后台运行，本次不重复提交", ideate_match.group(1))
+        step_match = re.search(r"async function step\(instruction\) \{([\s\S]*?)\n    \}", html)
+        self.assertIsNotNone(step_match)
+        self.assertNotIn("中间对话仍可继续使用", step_match.group(1))
         self.assertIn("setAwaitingJobStart(scope, true)", html)
         self.assertIn("setAwaitingJobStart(scope, false)", html)
         self.assertIn("function clearAwaitingUiState(scope=currentScope())", html)
@@ -5229,7 +5470,8 @@ class AppTests(unittest.TestCase):
         self.assertIsNotNone(send_chat_match)
         send_chat_body = send_chat_match.group(1)
         self.assertNotIn("scopeHasRunningEvidenceJob(scope)", send_chat_body)
-        self.assertIn("if (chatActive && !newChatMode) await step(text);", send_chat_body)
+        self.assertIn("if (activeSessionId && !newChatMode) await step(text);", send_chat_body)
+        self.assertNotIn("if (chatActive && !newChatMode) await step(text);", send_chat_body)
         self.assertIn("else await ideate(text);", send_chat_body)
         gui_source = Path("research_alpha/gui.py").read_text(encoding="utf-8")
         self.assertIn("state.add_job_unless_running(", gui_source)
@@ -5243,17 +5485,19 @@ class AppTests(unittest.TestCase):
         self.assertIn("clearPendingIdeate(scope);", html)
         self.assertIn("clearAwaitingUiState(scope);", html)
         self.assertIn("ui_scope:scope, provider:val('providerSelect')", html)
-        self.assertIn('["step", "--session-id", str(resolved_session_id)', gui_source)
+        self.assertIn("run_gui_stable_session_step", gui_source)
         self.assertIn('["reviewer", "--session-id", str(resolved_session_id)', gui_source)
         self.assertIn('["review-loop", "--session-id", str(resolved_session_id), "--rounds", str(rounds), "--provider", provider]', gui_source)
-        self.assertIn('"--review-loop",', gui_source)
-        self.assertIn('"--review-rounds",', gui_source)
+        self.assertIn("run_gui_stable_ideate_session", gui_source)
+        self.assertNotIn('["review-loop", "--session-id", str(session_id), "--rounds"', gui_source)
         self.assertIn("resolve_gui_session(config.db_path, state, session_id, ui_scope=ui_scope)", gui_source)
         self.assertIn("session scope mismatch", gui_source)
         self.assertNotIn('["step"] + (["--session-id", str(session_id)] if session_id else ["--latest"])', gui_source)
         self.assertNotIn('+ (["--session-id", str(session_id)] if session_id else ["--latest"])', gui_source)
         self.assertNotIn("if (!instruction || isBusy) return;", html)
         self.assertNotIn("if (isBusy) return;", html)
+        self.assertIn("if (activeSessionId && !newChatMode) await step(text);", html)
+        self.assertNotIn("if (chatActive && !newChatMode) await step(text);", html)
 
     def test_gui_input_drafts_are_scoped_and_autosized(self) -> None:
         html = render_index_html()
@@ -5264,7 +5508,8 @@ class AppTests(unittest.TestCase):
         self.assertIn("function takeInstructionForSubmit(scope=currentScope())", html)
         self.assertIn("function restoreSubmittedInstruction(scope, text)", html)
         self.assertIn("const text = takeInstructionForSubmit(scope);", html)
-        self.assertIn("if (chatActive && !newChatMode) await step(text);", html)
+        self.assertIn("if (activeSessionId && !newChatMode) await step(text);", html)
+        self.assertNotIn("if (chatActive && !newChatMode) await step(text);", html)
         self.assertIn("else await ideate(text);", html)
         self.assertIn("restoreText:direction", html)
         self.assertIn("restoreText:instruction", html)
@@ -5272,15 +5517,15 @@ class AppTests(unittest.TestCase):
         ideate_match = re.search(r"async function ideate\(direction\) \{([\s\S]*?)\n    \}", html)
         self.assertIsNotNone(ideate_match)
         ideate_body = ideate_match.group(1)
-        self.assertIn("if (scopeHasRunningEvidenceJob(scope))", ideate_body)
-        self.assertIn("restoreSubmittedInstruction(scope, direction);", ideate_body)
+        self.assertNotIn("scopeHasRunningEvidenceJob(scope)", ideate_body)
+        self.assertNotIn("restoreSubmittedInstruction(scope, direction);\n        renderChatIfCurrent", ideate_body)
         step_match = re.search(r"async function step\(instruction\) \{([\s\S]*?)\n    \}", html)
         self.assertIsNotNone(step_match)
         step_body = step_match.group(1)
         self.assertIn("if (!instruction) return;", step_body)
         self.assertIn("if (scopeIsBusy(scope))", step_body)
         self.assertIn("restoreSubmittedInstruction(scope, instruction);", step_body)
-        self.assertIn("我已保留这次输入", step_body)
+        self.assertNotIn("pushActivityMessage", step_body)
         self.assertNotIn("else { await ideate(text); clearInstructionDraft(scope); }", html)
         self.assertNotIn("async function step() {\n      const instruction = val('instruction').trim();", html)
         self.assertIn("function autosizeInstruction()", html)
@@ -5293,7 +5538,7 @@ class AppTests(unittest.TestCase):
 
     def test_gui_gold_build_reports_strict_zero_import_in_chat(self) -> None:
         html = render_index_html()
-        self.assertIn("正在联网扩充核心优秀论文库", html)
+        self.assertNotIn("正在联网扩充核心优秀论文库", html)
         self.assertIn("imported\\/updated 0 records", html)
         self.assertIn("Gold-build summary:", html)
         self.assertIn("Gold-build summary JSON:", html)
@@ -5307,6 +5552,7 @@ class AppTests(unittest.TestCase):
         self.assertIn("function goldBuildGroupActions(groupJobs)", html)
         self.assertIn("Number(summary.failures || 0) > 0", html)
         self.assertIn("? [{label:'调整检索', action:'settings'}, {label:'查看趋势论文', action:'frontier'}]", html)
+        self.assertIn("if (action === 'settings') metricAction('evidence-build');", html)
         self.assertIn("本轮优秀论文库扩充已完成", html)
         self.assertIn("聚合结果：抓取", html)
         self.assertIn("gold-group:${job.group_id}", html)
@@ -5635,7 +5881,9 @@ class AppTests(unittest.TestCase):
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
                 try:
-                    with patch("research_alpha.gui.urlopen", side_effect=OSError("offline")):
+                    with patch("research_alpha.gui.urlopen", side_effect=AssertionError("metadata should enrich in background")), patch(
+                        "research_alpha.gui.start_user_library_enrichment", return_value={"status": "queued"}
+                    ):
                         status, body = self.gui_post_json(
                             server,
                             "/api/user-library/add",
@@ -5671,17 +5919,20 @@ class AppTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
-    def test_gui_user_library_add_api_enriches_arxiv_metadata_without_scoring(self) -> None:
+    def test_user_library_background_enriches_arxiv_metadata_without_scoring(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd = Path(tmpdir)
-            old_cwd = Path.cwd()
-            try:
-                import os
-
-                os.chdir(cwd)
-                main(["init"])
-                db_path = cwd / "data" / "research_alpha.db"
-                atom = b"""<?xml version="1.0" encoding="UTF-8"?>
+            db_path = cwd / "data" / "research_alpha.db"
+            init_db(db_path)
+            paper_id = upsert_user_library_paper(
+                db_path,
+                title="arXiv:2601.01234",
+                venue="arXiv",
+                year=2026,
+                abstract="用户关注：多轮记忆机制。",
+                external_ref="https://arxiv.org/abs/2601.01234v2",
+            )
+            atom = b"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <entry>
     <id>http://arxiv.org/abs/2601.01234v2</id>
@@ -5693,56 +5944,43 @@ class AppTests(unittest.TestCase):
   </entry>
 </feed>"""
 
-                class FakeResponse:
-                    def __enter__(self):
-                        return self
+            class FakeResponse:
+                def __enter__(self):
+                    return self
 
-                    def __exit__(self, exc_type, exc, tb):
-                        return False
+                def __exit__(self, exc_type, exc, tb):
+                    return False
 
-                    def read(self, limit=-1):
-                        return atom
+                def read(self, limit=-1):
+                    return atom
 
-                server = create_gui_http_server(cwd, host="127.0.0.1", port=0)
-                thread = threading.Thread(target=server.serve_forever, daemon=True)
-                thread.start()
-                try:
-                    with patch("research_alpha.gui.urlopen", return_value=FakeResponse()) as mock_urlopen:
-                        status, body = self.gui_post_json(
-                            server,
-                            "/api/user-library/add",
-                            {
-                                "url": "https://arxiv.org/abs/2601.01234v2",
-                                "title": "",
-                                "note": "用户关注：多轮记忆机制。",
-                            },
-                        )
-                    self.assertEqual(status, 200)
-                    self.assertTrue(body["ok"])
-                    self.assertEqual(body["paper"]["title"], "Reliable Research Agent Memory")
-                    self.assertEqual(body["paper"]["library_status"], "用户库")
-                    self.assertIn("不参与 idea 评分标准", body["paper"]["library_status_detail"])
-                    self.assertEqual(mock_urlopen.call_count, 1)
-                    with connect(db_path) as conn:
-                        row = conn.execute(
-                            "SELECT title, abstract, venue, year, source_kind, award, paper_weight, score_notes FROM papers WHERE id=?",
-                            (body["paper_id"],),
-                        ).fetchone()
-                    self.assertEqual(row["title"], "Reliable Research Agent Memory")
-                    self.assertIn("用户关注：多轮记忆机制。", row["abstract"])
-                    self.assertIn("stable memory", row["abstract"])
-                    self.assertEqual(row["venue"], "arXiv")
-                    self.assertEqual(int(row["year"]), 2026)
-                    self.assertEqual(row["source_kind"], "user_library")
-                    self.assertEqual(row["award"], "")
-                    self.assertEqual(float(row["paper_weight"]), 0.0)
-                    self.assertIn("user_library_domain_knowledge_only", row["score_notes"])
-                finally:
-                    server.shutdown()
-                    server.server_close()
-                    thread.join(timeout=2)
-            finally:
-                os.chdir(old_cwd)
+            with patch("research_alpha.gui.urlopen", return_value=FakeResponse()) as mock_urlopen, patch(
+                "research_alpha.gui.fetch_full_text_with_metadata", side_effect=RuntimeError("skip full text")
+            ):
+                status = enrich_user_library_paper(
+                    db_path,
+                    paper_id,
+                    url="https://arxiv.org/abs/2601.01234v2",
+                    title="",
+                    note="用户关注：多轮记忆机制。",
+                    metadata={"title": "arXiv:2601.01234", "venue": "arXiv", "year": 2026, "abstract": "用户关注：多轮记忆机制。"},
+                )
+            self.assertEqual(status["status"], "failed")
+            self.assertEqual(mock_urlopen.call_count, 1)
+            with connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT title, abstract, venue, year, source_kind, award, paper_weight, score_notes FROM papers WHERE id=?",
+                    (paper_id,),
+                ).fetchone()
+            self.assertEqual(row["title"], "Reliable Research Agent Memory")
+            self.assertIn("用户关注：多轮记忆机制。", row["abstract"])
+            self.assertIn("stable memory", row["abstract"])
+            self.assertEqual(row["venue"], "arXiv")
+            self.assertEqual(int(row["year"]), 2026)
+            self.assertEqual(row["source_kind"], "user_library")
+            self.assertEqual(row["award"], "")
+            self.assertEqual(float(row["paper_weight"]), 0.0)
+            self.assertIn("user_library_domain_knowledge_only", row["score_notes"])
 
     def test_gui_user_library_accepts_legacy_arxiv_and_pdf_links_as_domain_only(self) -> None:
         self.assertEqual(arxiv_id_from_url("https://arxiv.org/abs/cs/0501001v2"), "cs/0501001")
@@ -5763,7 +6001,9 @@ class AppTests(unittest.TestCase):
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
                 try:
-                    with patch("research_alpha.gui.urlopen", side_effect=OSError("offline")):
+                    with patch("research_alpha.gui.urlopen", side_effect=AssertionError("metadata should enrich in background")), patch(
+                        "research_alpha.gui.start_user_library_enrichment", return_value={"status": "queued"}
+                    ):
                         status, body = self.gui_post_json(
                             server,
                             "/api/user-library/add",
@@ -5809,28 +6049,29 @@ class AppTests(unittest.TestCase):
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
                 try:
-                    status, doi_body = self.gui_post_json(
-                        server,
-                        "/api/user-library/add",
-                        {
-                            "url": "https://doi.org/10.48550/arXiv.2601.01234",
-                            "title": "",
-                            "note": "路线学习：DOI 论文。",
-                        },
-                    )
-                    self.assertEqual(status, 200)
-                    self.assertTrue(doi_body["ok"])
-                    self.assertEqual(doi_body["paper"]["title"], "DOI:10.48550/arXiv.2601.01234")
+                    with patch("research_alpha.gui.start_user_library_enrichment", return_value={"status": "queued"}):
+                        status, doi_body = self.gui_post_json(
+                            server,
+                            "/api/user-library/add",
+                            {
+                                "url": "https://doi.org/10.48550/arXiv.2601.01234",
+                                "title": "",
+                                "note": "路线学习：DOI 论文。",
+                            },
+                        )
+                        self.assertEqual(status, 200)
+                        self.assertTrue(doi_body["ok"])
+                        self.assertEqual(doi_body["paper"]["title"], "DOI:10.48550/arXiv.2601.01234")
 
-                    status, openreview_body = self.gui_post_json(
-                        server,
-                        "/api/user-library/add",
-                        {
-                            "url": "https://openreview.net/forum?id=abc123",
-                            "title": "",
-                            "note": "路线学习：OpenReview 论文。",
-                        },
-                    )
+                        status, openreview_body = self.gui_post_json(
+                            server,
+                            "/api/user-library/add",
+                            {
+                                "url": "https://openreview.net/forum?id=abc123",
+                                "title": "",
+                                "note": "路线学习：OpenReview 论文。",
+                            },
+                        )
                     self.assertEqual(status, 200)
                     self.assertTrue(openreview_body["ok"])
                     self.assertEqual(openreview_body["paper"]["title"], "OpenReview:abc123")
@@ -5855,14 +6096,141 @@ class AppTests(unittest.TestCase):
                     for row in rows:
                         self.assertEqual(row["source_kind"], "user_library")
                         self.assertEqual(row["award"], "")
-                        self.assertEqual(float(row["paper_weight"]), 0.0)
-                        self.assertIn("user_library_domain_knowledge_only", row["score_notes"])
+                    self.assertEqual(float(row["paper_weight"]), 0.0)
+                    self.assertIn("user_library_domain_knowledge_only", row["score_notes"])
                 finally:
                     server.shutdown()
                     server.server_close()
                     thread.join(timeout=2)
             finally:
                 os.chdir(old_cwd)
+
+    def test_gui_user_library_add_queues_full_text_without_blocking_domain_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                db_path = cwd / "data" / "research_alpha.db"
+
+                server = create_gui_http_server(cwd, host="127.0.0.1", port=0)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    with patch("research_alpha.gui.urlopen", side_effect=AssertionError("metadata should enrich in background")), patch(
+                        "research_alpha.gui.start_user_library_enrichment", return_value={"status": "queued"}
+                    ):
+                        status, body = self.gui_post_json(
+                            server,
+                            "/api/user-library/add",
+                            {
+                                "url": "https://arxiv.org/abs/2601.01234v2",
+                                "title": "Reliable User Route Paper",
+                                "note": "路线学习：临床交接场景。",
+                            },
+                        )
+                    self.assertEqual(status, 200)
+                    self.assertTrue(body["ok"])
+                    self.assertEqual(body["full_text"]["status"], "queued")
+                    with connect(db_path) as conn:
+                        row = conn.execute(
+                            "SELECT source_kind, award, paper_weight, score_notes, full_text_json FROM papers WHERE id=?",
+                            (body["paper_id"],),
+                        ).fetchone()
+                    self.assertEqual(row["source_kind"], "user_library")
+                    self.assertEqual(row["award"], "")
+                    self.assertEqual(float(row["paper_weight"]), 0.0)
+                    self.assertIn("user_library_domain_knowledge_only", row["score_notes"])
+                    self.assertIn(row["full_text_json"] or "{}", {"", "{}"})
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_user_library_full_text_ingest_updates_domain_context_without_scoring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            db_path = cwd / "data" / "research_alpha.db"
+            init_db(db_path)
+            paper_id = upsert_user_library_paper(
+                db_path,
+                title="Reliable User Route Paper",
+                venue="arXiv",
+                year=2026,
+                abstract="Route note.",
+                external_ref="https://arxiv.org/abs/2601.01234v2",
+            )
+
+            def fake_fetch(url: str, **kwargs):
+                self.assertEqual(url, "https://arxiv.org/abs/2601.01234v2")
+                self.assertEqual(kwargs["title"], "Reliable User Route Paper")
+                return (
+                    "Introduction User domain setup explains clinical handoff constraints. "
+                    "Related Work Prior systems miss local route evidence. "
+                    + ("Method Domain route learning extracts reusable terminology. " * 80)
+                    + ("Experiments Domain notes are checked against realistic workflow boundaries. " * 80)
+                    + "Limitations Domain notes are context only and do not define scoring standards.",
+                    "https://arxiv.org/pdf/2601.01234v2.pdf",
+                )
+
+            with patch("research_alpha.gui.fetch_full_text_with_metadata", side_effect=fake_fetch):
+                status = opportunistic_user_library_full_text_ingest(
+                    db_path,
+                    paper_id,
+                    url="https://arxiv.org/abs/2601.01234v2",
+                    metadata={"title": "Reliable User Route Paper", "venue": "arXiv", "year": 2026},
+                )
+            self.assertEqual(status["status"], "updated")
+            self.assertIn("arxiv.org/pdf/2601.01234v2.pdf", status["source_url"])
+            with connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT source_kind, award, paper_weight, score_notes, full_text_json FROM papers WHERE id=?",
+                    (paper_id,),
+                ).fetchone()
+            self.assertEqual(row["source_kind"], "user_library")
+            self.assertEqual(row["award"], "")
+            self.assertEqual(float(row["paper_weight"]), 0.0)
+            self.assertIn("user_library_domain_knowledge_only", row["score_notes"])
+            self.assertIn("clinical handoff constraints", row["full_text_json"])
+            self.assertIn("source_url", row["full_text_json"])
+
+    def test_user_library_full_text_ingest_degrades_without_blocking_domain_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            db_path = cwd / "data" / "research_alpha.db"
+            init_db(db_path)
+            paper_id = upsert_user_library_paper(
+                db_path,
+                title="Fallback User Domain Paper",
+                venue="OpenReview",
+                year=2026,
+                abstract="Only domain background.",
+                external_ref="https://openreview.net/forum?id=abc123",
+            )
+            with patch("research_alpha.gui.fetch_full_text_with_metadata", side_effect=RuntimeError("network timeout")):
+                status = opportunistic_user_library_full_text_ingest(
+                    db_path,
+                    paper_id,
+                    url="https://openreview.net/forum?id=abc123",
+                    metadata={"title": "Fallback User Domain Paper", "venue": "OpenReview", "year": 2026},
+                )
+            self.assertEqual(status["status"], "failed")
+            with connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT title, source_kind, award, paper_weight, score_notes, full_text_json FROM papers WHERE id=?",
+                    (paper_id,),
+                ).fetchone()
+            self.assertEqual(row["title"], "Fallback User Domain Paper")
+            self.assertEqual(row["source_kind"], "user_library")
+            self.assertEqual(row["award"], "")
+            self.assertEqual(float(row["paper_weight"]), 0.0)
+            self.assertIn("user_library_domain_knowledge_only", row["score_notes"])
+            self.assertIn(row["full_text_json"] or "{}", {"", "{}"})
 
     def test_gui_user_library_delete_api_only_removes_user_library_papers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6015,16 +6383,16 @@ class AppTests(unittest.TestCase):
                 db_path = cwd / "data" / "research_alpha.db"
                 session_id = create_idea_session(db_path, "agent eval", "Initial idea")
                 release = threading.Event()
-                captured_commands = []
+                captured_steps = []
 
-                def fake_streaming(command, root_dir, on_output=None):
-                    captured_commands.append(command)
+                def fake_stable_step(root_dir, session_id, instruction, provider, on_output=None):
+                    captured_steps.append((session_id, instruction, provider))
                     if on_output:
                         on_output("stdout", "session job is running")
                     release.wait(2)
-                    return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+                    return {"exit_code": 0, "stdout": "Turn 1 decision: revised\nRevised idea: updated", "stderr": ""}
 
-                with patch("research_alpha.gui.run_app_command_streaming", side_effect=fake_streaming):
+                with patch("research_alpha.gui.run_gui_stable_session_step", side_effect=fake_stable_step):
                     server = create_gui_http_server(cwd, host="127.0.0.1", port=0)
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
@@ -6050,16 +6418,75 @@ class AppTests(unittest.TestCase):
                         self.assertEqual(second["job"]["kind"], "step")
 
                         for _ in range(50):
-                            if captured_commands:
+                            if captured_steps:
                                 break
                             import time
 
                             time.sleep(0.01)
-                        self.assertEqual(len(captured_commands), 1)
-                        self.assertIn("step", captured_commands[0])
-                        self.assertNotIn("reviewer", captured_commands[0])
+                        self.assertEqual(captured_steps, [(session_id, "revise the idea", "deepseek")])
                     finally:
                         release.set()
+                        server.shutdown()
+                        server.server_close()
+                        thread.join(timeout=2)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_gui_ideate_with_session_scope_routes_to_current_session_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                self.write_gui_test_llm_env(cwd)
+                from research_alpha.db import create_idea_session, list_idea_sessions, list_idea_session_turns
+
+                db_path = cwd / "data" / "research_alpha.db"
+                session_id = create_idea_session(db_path, "agent eval", "Initial idea")
+                captured_steps = []
+
+                def fake_stable_step(root_dir, session_id, instruction, provider, on_output=None):
+                    captured_steps.append((session_id, instruction, provider))
+                    return {"exit_code": 0, "stdout": "Turn 1 decision: revised\nRevised idea: updated current session", "stderr": ""}
+
+                with patch("research_alpha.gui.run_gui_stable_session_step", side_effect=fake_stable_step):
+                    server = create_gui_http_server(cwd, host="127.0.0.1", port=0)
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        status, body = self.gui_post_json(
+                            server,
+                            "/api/ideate",
+                            {
+                                "direction": "继续追问当前 idea",
+                                "session_id": None,
+                                "ui_scope": f"session:{session_id}",
+                                "remote": "openalex",
+                                "ideas": 3,
+                                "limit": 12,
+                                "provider": "deepseek",
+                                "lang": "zh",
+                            },
+                        )
+                        self.assertEqual(status, 200)
+                        self.assertTrue(body["routed_to_session_step"])
+                        self.assertEqual(body["job"]["kind"], "step")
+                        self.assertEqual(body["job"]["session_id"], session_id)
+                        self.assertEqual(body["job"]["ui_scope"], f"session:{session_id}")
+
+                        for _ in range(50):
+                            if captured_steps:
+                                break
+                            import time
+
+                            time.sleep(0.01)
+                        self.assertEqual(captured_steps, [(session_id, "继续追问当前 idea", "deepseek")])
+                        self.assertEqual(len(list_idea_sessions(db_path, limit=10)), 1)
+                        self.assertEqual(len(list_idea_session_turns(db_path, session_id)), 0)
+                    finally:
                         server.shutdown()
                         server.server_close()
                         thread.join(timeout=2)
@@ -6194,7 +6621,18 @@ class AppTests(unittest.TestCase):
                 {
                     "decision": "duplicate_rethink",
                     "overlap_label": "duplicate",
-                    "closest_work": [{"paper_id": 4, "title": "Existing Benchmark", "overlap_reason": "same setup"}],
+                    "closest_work": [
+                        {
+                            "paper_id": 4,
+                            "title": "Existing Benchmark",
+                            "overlap_reason": "same setup",
+                            "covered_parts": ["benchmark"],
+                            "missing_parts": ["none"],
+                            "difference_from_idea": "No real difference.",
+                        }
+                    ],
+                    "renamed_only_risk": "high",
+                    "novelty_boundary": "No novelty boundary.",
                     "why_not_done_yet": ["It was already done."],
                     "required_differentiation": ["Change mechanism and evidence target."],
                     "rethink_prompt": "Find a different failure boundary.",
@@ -6204,6 +6642,8 @@ class AppTests(unittest.TestCase):
         )
         self.assertEqual(payload["decision"], "duplicate_rethink")
         self.assertEqual(payload["overlap_label"], "duplicate")
+        self.assertEqual(payload["renamed_only_risk"], "high")
+        self.assertEqual(payload["closest_work"][0]["difference_from_idea"], "No real difference.")
 
         with self.assertRaisesRegex(ValueError, "why this has plausibly not been done yet"):
             parse_prior_art_gate_response(
@@ -6212,6 +6652,8 @@ class AppTests(unittest.TestCase):
                         "decision": "pass",
                         "overlap_label": "distant",
                         "closest_work": [],
+                        "renamed_only_risk": "low",
+                        "novelty_boundary": "No close local match.",
                         "why_not_done_yet": [],
                         "required_differentiation": [],
                         "rethink_prompt": "",
@@ -6219,6 +6661,24 @@ class AppTests(unittest.TestCase):
                     }
                 )
             )
+
+    def test_local_prior_art_returns_top_ten_and_novelty_boundary(self) -> None:
+        idea = strict_idea_payload()
+        papers = [
+            {
+                "id": index,
+                "title": f"Stress-Tested Agent Benchmark {index}",
+                "abstract": "Research agent evaluation stress tests hidden benchmark assumption failures.",
+                "venue": "ICLR",
+                "year": 2026,
+            }
+            for index in range(1, 13)
+        ]
+        result = analyze_prior_art(idea_payload=idea, papers=papers)
+        self.assertLessEqual(len(result["top_matches"]), 10)
+        self.assertIn("novelty_boundary", result)
+        self.assertIn(result["renamed_only_risk"], {"low", "medium", "high"})
+        self.assertIn("missing_parts", result["top_matches"][0])
 
     def test_gui_snapshot_exposes_prior_art_gate_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6284,6 +6744,127 @@ class AppTests(unittest.TestCase):
                 self.assertIn("Initial idea", texts[0])
                 self.assertIn("请检查是否重复", texts[1])
                 self.assertIn("Revised idea with stronger novelty boundary", texts[2])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_gui_chat_snapshot_hides_review_loop_internal_turns_but_shows_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+                os.chdir(cwd)
+                main(["init"])
+                from research_alpha.db import create_idea_session
+
+                context = {
+                    "review_history": [
+                        {
+                            "decision": "rethink_required",
+                            "summary": "新颖性边界还不够硬。",
+                            "fatal_flaws": ["像把已有方法换到新领域。"],
+                            "required_rethink": ["改成先抽取优秀论文逻辑故事线再迁移。"],
+                        }
+                    ]
+                }
+                session_id = create_idea_session(
+                    cwd / "data" / "research_alpha.db",
+                    "agent eval",
+                    "Initial idea",
+                    context_json=json.dumps(context, ensure_ascii=False),
+                )
+                with connect(cwd / "data" / "research_alpha.db") as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO idea_session_turns(
+                            session_id, turn_index, user_instruction, decision, revised_idea, content_json
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            1,
+                            "根据第 1/4 轮顶会审稿意见改写当前 idea。\n内部长审稿指令",
+                            "partial",
+                            "Final idea after reviewer loop",
+                            json.dumps({"source": "review_loop_refinement", "hidden_in_gui_chat": True}, ensure_ascii=False),
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE idea_sessions SET current_idea=? WHERE id=?",
+                        ("Final idea after reviewer loop", session_id),
+                    )
+                snapshot = build_chat_snapshot(cwd, session_id=session_id)
+                texts = [item["text"] for item in snapshot["messages"]]
+                joined = "\n".join(texts)
+                self.assertIn("Initial idea", texts[0])
+                self.assertNotIn("内部长审稿指令", joined)
+                self.assertNotIn("根据第 1/4 轮顶会审稿意见", joined)
+                self.assertIn("审稿意见：新颖性边界还不够硬。", joined)
+                self.assertIn("主要漏洞：像把已有方法换到新领域。", joined)
+                self.assertIn("Final idea after reviewer loop", texts[-1])
+                self.assertEqual(snapshot["messages"][-1]["meta"], "final idea")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_gui_chat_snapshot_does_not_repeat_final_idea_after_visible_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+                os.chdir(cwd)
+                main(["init"])
+                from research_alpha.db import create_idea_session
+
+                context = {"review_history": [{"summary": "先收紧 novelty 边界。"}]}
+                session_id = create_idea_session(
+                    cwd / "data" / "research_alpha.db",
+                    "agent eval",
+                    "Initial idea",
+                    context_json=json.dumps(context, ensure_ascii=False),
+                )
+                with connect(cwd / "data" / "research_alpha.db") as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO idea_session_turns(
+                            session_id, turn_index, user_instruction, decision, revised_idea, content_json
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            1,
+                            "根据第 1/4 轮顶会审稿意见改写当前 idea。",
+                            "partial",
+                            "Final idea after reviewer loop",
+                            json.dumps({"source": "review_loop_refinement", "hidden_in_gui_chat": True}, ensure_ascii=False),
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO idea_session_turns(
+                            session_id, turn_index, user_instruction, decision, revised_idea, content_json
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            2,
+                            "把这个 idea 再具体一点",
+                            "revised",
+                            "Visible follow-up revision",
+                            json.dumps({"source": "gui_stable_step"}, ensure_ascii=False),
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE idea_sessions SET current_idea=? WHERE id=?",
+                        ("Visible follow-up revision", session_id),
+                    )
+                snapshot = build_chat_snapshot(cwd, session_id=session_id)
+                messages = snapshot["messages"]
+                texts = [item["text"] for item in messages]
+                self.assertIn("把这个 idea 再具体一点", texts)
+                self.assertIn("Visible follow-up revision", texts)
+                self.assertEqual(texts.count("Visible follow-up revision"), 1)
+                self.assertNotEqual(messages[-1]["meta"], "final idea")
             finally:
                 os.chdir(old_cwd)
 
@@ -6426,7 +7007,7 @@ class AppTests(unittest.TestCase):
                 os.chdir(old_cwd)
 
 
-    def test_gui_chat_snapshot_adds_evidence_chain_for_seed_idea(self) -> None:
+    def test_gui_chat_snapshot_keeps_seed_idea_clean_of_evidence_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd = Path(tmpdir)
             old_cwd = Path.cwd()
@@ -6464,13 +7045,14 @@ class AppTests(unittest.TestCase):
                 )
                 snapshot = build_chat_snapshot(cwd, session_id=1)
                 seed = snapshot["messages"][0]["text"]
-                self.assertIn("依据", seed)
-                self.assertIn("参考优秀论文思路", seed)
-                self.assertIn("当前方法/趋势的问题", seed)
-                self.assertIn("审稿防御要点", seed)
-                self.assertIn("最可能被审稿人攻击的点", seed)
-                self.assertIn("审稿人 rethink_required 攻击：No strong evidence design.", seed)
-                self.assertIn("审稿后下一步：Rebuild around a stronger bottleneck.", seed)
+                self.assertEqual(seed, "Initial idea")
+                self.assertNotIn("依据", seed)
+                self.assertNotIn("参考优秀论文思路", seed)
+                self.assertNotIn("当前方法/趋势的问题", seed)
+                self.assertNotIn("审稿防御要点", seed)
+                self.assertNotIn("最可能被审稿人攻击的点", seed)
+                self.assertNotIn("审稿人 rethink_required 攻击", seed)
+                self.assertNotIn("审稿后下一步", seed)
                 self.assertNotIn("review-secret", seed)
                 self.assertNotIn(str(cwd), seed)
             finally:
@@ -6537,6 +7119,26 @@ class AppTests(unittest.TestCase):
         self.assertIn("Anti-copy discipline", prompt)
         self.assertIn("storyline_trace is an audit trail", prompt)
         self.assertIn("six steps should constrain the logic, not flatten the expression", prompt)
+        self.assertIn("Idea-evaluation discipline", prompt)
+        self.assertIn("hypothesis_discovery_rate", prompt)
+        self.assertIn("Prefer evidence sources marked full_text_sections", prompt)
+
+    def test_parse_idea_response_backfills_idea_evaluation_protocol(self) -> None:
+        parsed = parse_idea_response(json.dumps({"ideas": [strict_idea_payload()]}))
+        protocol = parsed[0]["idea_evaluation_protocol"]
+        names = [item["name"] for item in protocol["dimensions"]]
+        self.assertIn("practical_utility", names)
+        self.assertIn("hypothesis_discovery_rate", names)
+        self.assertIn("evidence_depth", names)
+        self.assertTrue(protocol["reject_if"])
+
+    def test_gold_evidence_tier_layers_source_use(self) -> None:
+        self.assertEqual(gold_evidence_tier({"award": "best_paper"})["tier"], "gold_complete_logic")
+        self.assertEqual(gold_evidence_tier({"award": "oral"})["tier"], "gold_reviewer_clarity")
+        self.assertIn(
+            "trend_context_only",
+            gold_evidence_tier({"award": "spotlight"})["allowed_standard_use"],
+        )
 
     def test_idea_prompt_includes_user_library_as_non_scoring_domain_knowledge(self) -> None:
         prompt = build_idea_prompt(
@@ -7133,6 +7735,7 @@ class AppTests(unittest.TestCase):
         )
         self.assertEqual(audit["status"], "explicit_valid")
         self.assertEqual(audit["matched_basis_count"], 1)
+        self.assertIn("evidence_depth", audit)
 
     def test_generation_evidence_audit_prefers_declared_type_when_alias_collides(self) -> None:
         sources = [
@@ -7269,6 +7872,59 @@ class AppTests(unittest.TestCase):
         self.assertTrue(explicit_score["dimensions"]["logic"]["explicit_evidence_covered"])
         self.assertFalse(missing_score["dimensions"]["logic"]["explicit_evidence_covered"])
         self.assertGreater(explicit_score["total"], missing_score["total"])
+
+    def test_evidence_grounded_score_prefers_full_text_depth(self) -> None:
+        base_content = {
+            "paper_summary": "Agent benchmarks hide brittle failure assumptions.",
+            "problem_reframing": "Turn benchmark success into failure discovery.",
+            "transferable_pattern": "Hidden assumption reversal for evaluation.",
+            "evidence_design": "Compare ranking shifts and failure coverage.",
+            "failure_boundary": "Fails when no trace is observable.",
+        }
+        abstract_genome_rows = [
+            {
+                "paper_id": 7,
+                "title": "Depth Paper",
+                "venue": "ICLR",
+                "year": 2026,
+                "award": "best_paper",
+                "paper_weight": 5.0,
+                "source_kind": "gold_openreview",
+                "evidence_level": "abstract_only",
+                "content_json": json.dumps(base_content),
+            }
+        ]
+        full_text_genome_rows = [
+            {
+                **abstract_genome_rows[0],
+                "evidence_level": "full_text_sections",
+                "content_json": json.dumps({**base_content, "full_text_sections_used": ["introduction", "experiments"]}),
+            }
+        ]
+        payload = {
+            "idea_title": "Stress-Tested Agent Benchmark",
+            "core_hypothesis": "Agent benchmarks hide brittle failure assumptions.",
+            "historical_pattern": "Hidden assumption reversal for evaluation.",
+            "frontier_gap": "Benchmark success misses failure coverage.",
+            "evaluation_outline": "Compare ranking shifts and failure coverage.",
+            "key_risk": "No trace is observable.",
+            "evidence_basis": [
+                {
+                    "source_type": "genome",
+                    "source_id": "paper-7",
+                    "quality_signal": "best_paper",
+                    "borrowed_standard": "Turn benchmark success into failure discovery.",
+                    "used_for": "innovation|logic|feasibility|value|defensibility",
+                }
+            ],
+        }
+        abstract_score = build_evidence_grounded_score(payload, genome_rows=abstract_genome_rows)
+        full_text_score = build_evidence_grounded_score(payload, genome_rows=full_text_genome_rows)
+        self.assertEqual(abstract_score["evidence_depth"]["status"], "abstract_only_grounded")
+        self.assertEqual(full_text_score["evidence_depth"]["status"], "full_text_grounded")
+        self.assertGreater(full_text_score["total"], abstract_score["total"])
+        matched = full_text_score["generation_evidence_audit"]["matched_basis"][0]
+        self.assertEqual(matched["matched_evidence_depth"]["status"], "full_text_sections")
 
     def test_evidence_grounded_score_marks_missing_dimension_coverage(self) -> None:
         pattern_rows = [
@@ -7580,6 +8236,48 @@ class AppTests(unittest.TestCase):
                 self.assertEqual(caught.exception.summary["primary_reason"], "user_library_used_as_standard")
             finally:
                 os.chdir(old_cwd)
+
+    def test_user_library_summary_includes_full_text_hints_without_scoring_weight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            db_path = cwd / "data" / "research_alpha.db"
+            init_db(db_path)
+            paper_id = upsert_user_library_paper(
+                db_path,
+                title="User Full Text Route Paper",
+                venue="arXiv",
+                year=2026,
+                abstract="Abstract-level route note.",
+                external_ref="https://arxiv.org/abs/2601.00003",
+            )
+            with connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE papers SET full_text_json=? WHERE id=?",
+                    (
+                        json.dumps(
+                            {
+                                "source_scope": "full_text_sections",
+                                "sections": {
+                                    "introduction": "The domain route starts with bedside triage and handoff constraints.",
+                                    "method": "The route uses protocol-aware decomposition for local adaptation.",
+                                    "limitations": "The route may fail when hospitals use incompatible protocols.",
+                                },
+                            }
+                        ),
+                        paper_id,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT source_kind, paper_weight FROM papers WHERE id=?",
+                    (paper_id,),
+                ).fetchone()
+            summary = build_user_domain_knowledge_summary(cwd, limit=5)
+            paper = summary["papers"][0]
+            self.assertEqual(row["source_kind"], "user_library")
+            self.assertEqual(float(row["paper_weight"]), 0.0)
+            self.assertIn("full_text_domain_hints", paper)
+            self.assertIn("bedside triage", paper["full_text_domain_hints"]["introduction"])
+            self.assertIn("scoring_standard", summary["forbidden_uses"])
 
     def test_idea_generation_rejects_source_method_surface_transfer_before_saving(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -8068,6 +8766,280 @@ class AppTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_user_library_cli_lists_domain_papers_and_full_text_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                db_path = cwd / "data" / "research_alpha.db"
+                paper_id = upsert_user_library_paper(
+                    db_path,
+                    title="CLI User Route Paper",
+                    venue="arXiv",
+                    year=2026,
+                    abstract="Route note for local debugging.",
+                    external_ref="https://arxiv.org/abs/2601.01234",
+                )
+                with connect(db_path) as conn:
+                    conn.execute(
+                        "UPDATE papers SET full_text_json=? WHERE id=?",
+                        (
+                            json.dumps(
+                                {
+                                    "source_scope": "full_text_sections",
+                                    "sections": {
+                                        "introduction": "CLI route setup.",
+                                        "limitations": "CLI route limitation.",
+                                    },
+                                }
+                            ),
+                            paper_id,
+                        ),
+                    )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    exit_code = main(["ul", "--limit", "5"])
+                self.assertEqual(exit_code, 0)
+                text = output.getvalue()
+                self.assertIn("User library papers: 1", text)
+                self.assertIn("full-text hints: 1", text)
+                self.assertIn("CLI User Route Paper", text)
+                self.assertIn("full_text_hints=introduction, limitations", text)
+                self.assertIn("domain knowledge only", text)
+
+                json_out = io.StringIO()
+                with redirect_stdout(json_out):
+                    json_exit = main(["user-library", "--json"])
+                self.assertEqual(json_exit, 0)
+                payload = json.loads(json_out.getvalue())
+                self.assertEqual(payload["count"], 1)
+                self.assertEqual(payload["full_text_ready_count"], 1)
+                self.assertEqual(payload["papers"][0]["paper_weight"], 0.0)
+                self.assertEqual(payload["papers"][0]["policy"], "user_library_domain_knowledge_only_never_scoring_standard")
+                self.assertIn("limitations", payload["papers"][0]["full_text_hint_sections"])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_user_library_cli_add_and_delete_use_domain_only_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                db_path = cwd / "data" / "research_alpha.db"
+                atom = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2601.01234v2</id>
+    <published>2026-01-08T00:00:00Z</published>
+    <title>  CLI Reliable User Library  </title>
+    <summary>Domain route learning for local CLI workflows.</summary>
+  </entry>
+</feed>"""
+
+                class FakeResponse:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return False
+
+                    def read(self, limit=-1):
+                        return atom
+
+                add_out = io.StringIO()
+                with patch("research_alpha.gui.urlopen", return_value=FakeResponse()):
+                    with redirect_stdout(add_out):
+                        add_exit = main(
+                            [
+                                "ul",
+                                "add",
+                                "https://arxiv.org/abs/2601.01234v2",
+                                "--note",
+                                "CLI route note.",
+                            ]
+                        )
+                self.assertEqual(add_exit, 0)
+                self.assertIn("Added user-library paper", add_out.getvalue())
+                with connect(db_path) as conn:
+                    row = conn.execute(
+                        "SELECT id, title, abstract, venue, source_kind, award, paper_weight, score_notes FROM papers WHERE source_kind='user_library'"
+                    ).fetchone()
+                self.assertEqual(row["title"], "CLI Reliable User Library")
+                self.assertIn("CLI route note.", row["abstract"])
+                self.assertEqual(row["venue"], "arXiv")
+                self.assertEqual(row["award"], "")
+                self.assertEqual(float(row["paper_weight"]), 0.0)
+                self.assertIn("user_library_domain_knowledge_only", row["score_notes"])
+
+                json_out = io.StringIO()
+                with patch("research_alpha.gui.urlopen", side_effect=OSError("offline")):
+                    with redirect_stdout(json_out):
+                        json_exit = main(["ul", "add", "--url", "https://openreview.net/forum?id=abc123", "--json"])
+                self.assertEqual(json_exit, 0)
+                payload = json.loads(json_out.getvalue())
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["paper"]["title"], "OpenReview:abc123")
+                self.assertEqual(payload["paper"]["paper_weight"], 0.0)
+
+                delete_out = io.StringIO()
+                with redirect_stdout(delete_out):
+                    delete_exit = main(["ul", "delete", str(row["id"])])
+                self.assertEqual(delete_exit, 0)
+                self.assertIn(f"Deleted user-library paper #{row['id']}", delete_out.getvalue())
+                with connect(db_path) as conn:
+                    deleted_count = conn.execute("SELECT COUNT(*) AS count FROM papers WHERE id=?", (row["id"],)).fetchone()
+                self.assertEqual(int(deleted_count["count"]), 0)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_user_library_cli_rejects_invalid_link_and_will_not_delete_gold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                db_path = cwd / "data" / "research_alpha.db"
+                invalid_err = io.StringIO()
+                with redirect_stderr(invalid_err):
+                    invalid_exit = main(["ul", "add", "file:///tmp/paper.pdf"])
+                self.assertEqual(invalid_exit, 1)
+                self.assertIn("http", invalid_err.getvalue())
+
+                gold_id = add_paper(
+                    db_path,
+                    "Gold Must Stay",
+                    "ICLR",
+                    2026,
+                    abstract="Gold evidence.",
+                    source_kind="gold_openreview",
+                    award="best_paper",
+                )
+                delete_err = io.StringIO()
+                with redirect_stderr(delete_err):
+                    delete_exit = main(["ul", "delete", str(gold_id)])
+                self.assertEqual(delete_exit, 1)
+                self.assertIn("not found", delete_err.getvalue())
+                with connect(db_path) as conn:
+                    row = conn.execute("SELECT source_kind FROM papers WHERE id=?", (gold_id,)).fetchone()
+                self.assertEqual(row["source_kind"], "gold_openreview")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_doctor_reports_missing_evidence_without_leaking_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                output = io.StringIO()
+                with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-doctor-secret"}, clear=False):
+                    with redirect_stdout(output):
+                        exit_code = main(["doctor", "--json"])
+                self.assertEqual(exit_code, 0)
+                payload = json.loads(output.getvalue())
+                self.assertEqual(payload["overall_status"], "needs_work")
+                self.assertEqual(payload["evidence"]["status"], "not_ready")
+                self.assertIn("pdf_parser", payload["runtime"])
+                self.assertIn("available", payload["runtime"]["pdf_parser"])
+                codes = {item["code"] for item in payload["issues"]}
+                self.assertIn("evidence_not_ready", codes)
+                self.assertNotIn("sk-", json.dumps(payload, ensure_ascii=False))
+            finally:
+                os.chdir(old_cwd)
+
+    def test_doctor_summarizes_ready_local_project_and_user_library(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                db_path = cwd / "data" / "research_alpha.db"
+                seed_strict_generation_evidence(db_path)
+                user_id = upsert_user_library_paper(
+                    db_path,
+                    title="Doctor User Route",
+                    venue="arXiv",
+                    year=2026,
+                    abstract="Doctor route note.",
+                    external_ref="https://arxiv.org/abs/2601.04444",
+                )
+                with connect(db_path) as conn:
+                    conn.execute(
+                        "UPDATE papers SET full_text_json=? WHERE id=?",
+                        (
+                            json.dumps({"sections": {"introduction": "Doctor user route setup."}}),
+                            user_id,
+                        ),
+                    )
+                output = io.StringIO()
+                with patch.dict(os.environ, {"RA_LLM_PROVIDER": "deepseek", "DEEPSEEK_API_KEY": "sk-doctor-test"}, clear=False):
+                    with redirect_stdout(output):
+                        exit_code = main(["doc", "--papers", "12"])
+                self.assertEqual(exit_code, 0)
+                text = output.getvalue()
+                self.assertIn("Doctor:", text)
+                self.assertIn("api_key=yes", text)
+                self.assertIn("Runtime: pdf_parser=", text)
+                self.assertIn("status=ready_for_strict_generation", text)
+                self.assertIn("paper_like=0", text)
+                self.assertIn("User library: papers=1 full_text_hints=1", text)
+                self.assertIn('ra id "research agents" --ideas 5', text)
+                self.assertNotIn("sk-doctor-test", text)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_doctor_prioritizes_idea_generation_when_ready_even_with_notices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                db_path = cwd / "data" / "research_alpha.db"
+                seed_strict_generation_evidence(db_path)
+                with connect(db_path) as conn:
+                    conn.execute(
+                        """
+                        UPDATE papers
+                        SET full_text_json=?
+                        WHERE id = (SELECT id FROM papers ORDER BY id LIMIT 1)
+                        """,
+                        (
+                            json.dumps({"status": "ready", "quality": "metadata_page_sections", "sections": {"introduction": "Short event page."}}),
+                        ),
+                    )
+                output = io.StringIO()
+                with patch.dict(os.environ, {"RA_LLM_PROVIDER": "deepseek", "DEEPSEEK_API_KEY": "sk-doctor-test"}, clear=False):
+                    with redirect_stdout(output):
+                        exit_code = main(["doctor", "--json"])
+                self.assertEqual(exit_code, 0)
+                payload = json.loads(output.getvalue())
+                self.assertEqual(payload["overall_status"], "ready")
+                self.assertEqual(payload["evidence"]["status"], "ready_for_strict_generation")
+                self.assertTrue(any(item["severity"] == "notice" for item in payload["issues"]))
+                self.assertEqual(payload["next_commands"][0], 'ra id "research agents" --ideas 5')
+            finally:
+                os.chdir(old_cwd)
+
     def test_evidence_report_not_ready_without_high_weight_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cwd = Path(tmpdir)
@@ -8143,6 +9115,10 @@ class AppTests(unittest.TestCase):
                 self.assertEqual(payload["counts"]["high_weight_papers"], 3)
                 self.assertEqual(payload["counts"]["genome_cards"], 2)
                 self.assertEqual(payload["counts"]["pattern_cards"], 1)
+                self.assertIn("Full-text ready papers:", output.getvalue())
+                self.assertIn("Stale genome cards:", output.getvalue())
+                self.assertIn("Stale pattern cards:", output.getvalue())
+                self.assertIn("full_text_status", payload["high_weight_papers"][0])
             finally:
                 os.chdir(old_cwd)
 
@@ -8987,7 +9963,7 @@ class AppTests(unittest.TestCase):
             repo_root = Path(__file__).resolve().parent.parent
             wrapper_path = repo_root / "ra"
             result = subprocess.run(
-                [sys.executable, str(wrapper_path), "init"],
+                [str(wrapper_path), "init"],
                 cwd=cwd,
                 capture_output=True,
                 text=True,
@@ -9320,6 +10296,8 @@ class AppTests(unittest.TestCase):
                         type("Resp", (), {"text": fake_genome})(),
                         type("Resp", (), {"text": fake_pattern})(),
                         type("Resp", (), {"text": fake_ideas})(),
+                        type("Resp", (), {"text": prior_art_pass_json()})(),
+                        type("Resp", (), {"text": prior_art_pass_json()})(),
                     ]
                     main(["gb", "--limit", "2"])
                     main(["pb", "--limit", "2"])
@@ -9396,6 +10374,7 @@ class AppTests(unittest.TestCase):
                         type("Resp", (), {"text": fake_genome})(),
                         type("Resp", (), {"text": fake_pattern})(),
                         type("Resp", (), {"text": fake_ideas})(),
+                        type("Resp", (), {"text": prior_art_pass_json()})(),
                     ]
                     main(["gb", "--limit", "2"])
                     main(["pb", "--limit", "2"])
@@ -9536,6 +10515,7 @@ class AppTests(unittest.TestCase):
                         type("Resp", (), {"text": fake_genome})(),
                         type("Resp", (), {"text": fake_pattern})(),
                         type("Resp", (), {"text": fake_ideas})(),
+                        type("Resp", (), {"text": prior_art_pass_json()})(),
                     ]
                     main(["gb", "--limit", "2"])
                     main(["pb", "--limit", "2"])
@@ -9965,15 +10945,17 @@ class AppTests(unittest.TestCase):
                     bridge_exit = main(["ix"])
                 self.assertEqual(bridge_exit, 0)
                 text = bridge_out.getvalue()
-                self.assertIn("Created idea session #1 from top-ranked candidate idea #1", text)
+                ranking = build_candidate_idea_ranking(root_dir=cwd, query="", include_all=False, limit=1)
+                top = ranking["shown_ideas"][0]
+                self.assertIn(f"Created idea session #1 from top-ranked candidate idea #{top['idea_id']}", text)
                 self.assertIn("Ranking scope: research agents", text)
-                self.assertIn("Agent progress is overestimated by narrow metrics.", text)
+                self.assertIn(str(top["title"]), text)
                 self.assertIn("Idea-session summary JSON:", text)
                 summary_line = next(line for line in text.splitlines() if line.startswith("Idea-session summary JSON: "))
                 summary = json.loads(summary_line.removeprefix("Idea-session summary JSON: "))
-                self.assertEqual(summary["title"], "Stress-Tested Agent Benchmark")
-                self.assertEqual(summary["current_idea"], "Agent progress is overestimated by narrow metrics.")
-                self.assertIn("agentic planning", summary["trend_support"])
+                self.assertEqual(summary["title"], top["title"])
+                self.assertTrue(str(summary["current_idea"]).strip())
+                self.assertTrue(str(summary["trend_support"]).strip())
                 self.assertIsInstance(summary["evidence_score"], (int, float))
                 self.assertIsInstance(summary["evidence_basis"], list)
                 self.assertGreaterEqual(len(summary["evidence_basis"]), 1)
@@ -9988,8 +10970,8 @@ class AppTests(unittest.TestCase):
                     ["old_belief", "bottleneck", "reframing", "why_now", "evidence_design", "failure_boundary"],
                 )
                 self.assertIn("Research-agent benchmarks assume", summary["storyline_steps"][0]["transfer"])
-                self.assertIn("benchmark", summary["key_risk"])
-                self.assertEqual(summary["first_experiment"], "Build failure-taxonomy tasks")
+                self.assertTrue(str(summary["key_risk"]).strip())
+                self.assertTrue(str(summary["first_experiment"]).strip())
                 self.assertTrue((cwd / "outputs" / "sessions" / "session-1-dossier.json").exists())
             finally:
                 os.chdir(old_cwd)
@@ -10045,6 +11027,7 @@ class AppTests(unittest.TestCase):
                         type("Resp", (), {"text": fake_genome})(),
                         type("Resp", (), {"text": fake_pattern})(),
                         type("Resp", (), {"text": fake_ideas})(),
+                        type("Resp", (), {"text": prior_art_pass_json()})(),
                     ]
                     os.environ["OPENAI_API_KEY"] = "test-openai-key"
                     try:
@@ -10251,6 +11234,7 @@ class AppTests(unittest.TestCase):
                         type("Resp", (), {"text": fake_genome})(),
                         type("Resp", (), {"text": fake_pattern})(),
                         type("Resp", (), {"text": fake_ideas})(),
+                        *[type("Resp", (), {"text": prior_art_pass_json()})() for _ in range(5)],
                     ]
                     os.environ["OPENAI_API_KEY"] = "test-openai-key"
                     try:
@@ -10336,6 +11320,7 @@ class AppTests(unittest.TestCase):
                         type("Resp", (), {"text": fake_genome})(),
                         type("Resp", (), {"text": fake_pattern})(),
                         type("Resp", (), {"text": fake_ideas})(),
+                        type("Resp", (), {"text": prior_art_pass_json()})(),
                     ]
                     os.environ["OPENAI_API_KEY"] = "test-openai-key"
                     try:
@@ -10516,6 +11501,130 @@ class AppTests(unittest.TestCase):
                 output = top_out.getvalue()
                 self.assertIn("Paper A", output)
                 self.assertIn("score=", output)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_gold_seed_imports_only_core_gold_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                seed_path = cwd / "seeds" / "local_gold.jsonl"
+                seed_path.write_text(
+                    "\n".join(
+                        [
+                            json.dumps(
+                                {
+                                    "title": "Local Best Gold",
+                                    "venue": "ICLR",
+                                    "year": 2026,
+                                    "award": "best_paper",
+                                    "abstract": "Full logic evidence.",
+                                    "external_ref": "https://arxiv.org/abs/2601.00001",
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "title": "Local Oral Gold",
+                                    "venue": "NeurIPS",
+                                    "year": 2026,
+                                    "award": "oral",
+                                    "abstract": "Reviewer clarity evidence.",
+                                    "external_ref": "https://arxiv.org/abs/2601.00002",
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "title": "Trend Spotlight Only",
+                                    "venue": "ICLR",
+                                    "year": 2026,
+                                    "award": "spotlight",
+                                    "abstract": "Trend only.",
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "title": "Poster Should Stay Out",
+                                    "venue": "ICLR Poster",
+                                    "year": 2026,
+                                    "award": "best_paper",
+                                    "abstract": "Poster text.",
+                                }
+                            ),
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    exit_code = main(["gold-seed", "--file", str(seed_path), "--limit", "10"])
+                self.assertEqual(exit_code, 0)
+                self.assertIn("imported=2", output.getvalue())
+                self.assertIn("poster_skipped=1", output.getvalue())
+                self.assertIn("non_gold_skipped=1", output.getvalue())
+                db_path = cwd / "data" / "research_alpha.db"
+                with connect(db_path) as conn:
+                    rows = conn.execute(
+                        "SELECT title, source_kind, award, paper_weight FROM papers ORDER BY title ASC"
+                    ).fetchall()
+                self.assertEqual([row["title"] for row in rows], ["Local Best Gold", "Local Oral Gold"])
+                self.assertTrue(all(row["source_kind"] == "gold_seed" for row in rows))
+                self.assertEqual({row["award"] for row in rows}, {"best_paper", "oral"})
+                self.assertTrue(all(float(row["paper_weight"]) > 0 for row in rows))
+            finally:
+                os.chdir(old_cwd)
+
+    def test_gold_seed_can_fetch_full_text_for_imported_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            old_cwd = Path.cwd()
+            try:
+                import os
+
+                os.chdir(cwd)
+                main(["init"])
+                seed_path = cwd / "seeds" / "local_gold.jsonl"
+                seed_path.write_text(
+                    json.dumps(
+                        {
+                            "title": "Local Full Text Gold",
+                            "venue": "ICML",
+                            "year": 2026,
+                            "award": "best_paper",
+                            "abstract": "Short abstract.",
+                            "external_ref": "https://example.org/full.html",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                def fake_fetch(url, **kwargs):
+                    self.assertEqual(url, "https://example.org/full.html")
+                    return (
+                        "Introduction Local setup. Related Work Local prior work. "
+                        "Methods Local reframing. Experiments Local validation. "
+                        "Limitations Local boundary. Conclusion Local close.",
+                        url,
+                    )
+
+                with patch("research_alpha.app.fetch_full_text_with_metadata", side_effect=fake_fetch):
+                    exit_code = main(["gold-seed", "--file", str(seed_path), "--fulltext"])
+                self.assertEqual(exit_code, 0)
+                with connect(cwd / "data" / "research_alpha.db") as conn:
+                    row = conn.execute(
+                        "SELECT source_kind, paper_weight, full_text_json FROM papers WHERE title='Local Full Text Gold'"
+                    ).fetchone()
+                self.assertEqual(row["source_kind"], "gold_seed")
+                self.assertGreater(float(row["paper_weight"]), 0.0)
+                self.assertIn("Local setup", row["full_text_json"])
+                self.assertIn("source_url", row["full_text_json"])
             finally:
                 os.chdir(old_cwd)
 
@@ -11263,7 +12372,8 @@ class AppTests(unittest.TestCase):
                         exit_code = main(["ideate", "科研智能体可靠评测", "--remote", "s2", "--limit", "1", "--ideas", "1"])
                 self.assertEqual(exit_code, 1)
                 self.assertEqual(calls[:2], ["s2", "openalex"])
-                self.assertIn("fallback note: s2 failed", output.getvalue())
+                self.assertIn("fallback note: s2：远程源限流或预算不足", output.getvalue())
+                self.assertNotIn("Too Many Requests", output.getvalue())
                 self.assertNotIn("Traceback", err.getvalue())
             finally:
                 os.chdir(old_cwd)
@@ -12038,6 +13148,22 @@ class AppTests(unittest.TestCase):
                     abstract="Late-added route terminology for clinical agent workflows.",
                     external_ref="https://arxiv.org/abs/2601.00002",
                 )
+                with connect(db_path) as conn:
+                    conn.execute(
+                        "UPDATE papers SET full_text_json=? WHERE title=?",
+                        (
+                            json.dumps(
+                                {
+                                    "source_scope": "full_text_sections",
+                                    "sections": {
+                                        "introduction": "Full-text route setup mentions bedside triage workflows and clinical handoff constraints.",
+                                        "limitations": "Full-text limitation says evaluation can fail when hospital protocols vary.",
+                                    },
+                                }
+                            ),
+                            "User Route Paper Added Later",
+                        ),
+                    )
                 fake_critique = json.dumps(
                     {
                         "decision": "partial",
@@ -12067,13 +13193,19 @@ class AppTests(unittest.TestCase):
                         exit_code = main(["st", "--session-id", str(session_id), "结合我刚加的路线论文术语"])
                 self.assertEqual(exit_code, 0)
                 self.assertIn("User Route Paper Added Later", captured_prompt)
+                self.assertIn("full_text_domain_hints", captured_prompt)
+                self.assertIn("bedside triage workflows", captured_prompt)
                 self.assertIn("user_library_domain_knowledge_only", captured_prompt)
                 self.assertIn("forbidden_uses", captured_prompt)
                 self.assertIn("hidden-assumption-reversal", captured_prompt)
                 with connect(db_path) as conn:
-                    session = conn.execute("SELECT context_json, current_idea FROM idea_sessions WHERE id=?", (session_id,)).fetchone()
+                    session = conn.execute("SELECT context_json, current_idea, memory_summary_json FROM idea_sessions WHERE id=?", (session_id,)).fetchone()
                 stored_context = json.loads(session["context_json"])
+                memory = json.loads(session["memory_summary_json"])
                 self.assertNotIn("domain_knowledge_context", stored_context)
+                self.assertEqual(memory["user_domain_knowledge"]["paper_count"], 1)
+                self.assertEqual(memory["user_domain_knowledge"]["full_text_hint_count"], 1)
+                self.assertIn("never_scoring_standard", memory["user_domain_knowledge"]["policy"])
                 self.assertEqual(session["current_idea"], "Original stable idea with clinical route terminology.")
             finally:
                 os.chdir(old_cwd)

@@ -80,6 +80,7 @@ def build_session_memory_summary(
     preferred_language = infer_preferred_language(session, turn_items, session_context)
     recent_limitations = extract_recent_limitations(session_context)
     review_focus = extract_review_focus(session_context)
+    user_domain_knowledge = summarize_user_domain_knowledge(session_context)
     first_experiments = session_context.get("first_experiments", [])
     if isinstance(first_experiments, list):
         next_experiments.extend(str(item).strip() for item in first_experiments if str(item).strip())
@@ -110,6 +111,7 @@ def build_session_memory_summary(
             "prior_art_summary": compact_text(session_context.get("prior_art_summary", ""), 360),
         },
         "scoring_standard_policy": SCORING_STANDARD_POLICY,
+        "user_domain_knowledge": user_domain_knowledge,
         "recent_limitations_focus": recent_limitations,
         "accepted_user_preferences": compact_list(accepted_preferences, limit=8, chars=240),
         "partially_accepted_preferences": compact_list(partial_preferences, limit=8, chars=240),
@@ -168,6 +170,12 @@ def render_memory_markdown(memory: Dict[str, object]) -> List[str]:
             lines.append(f"- Historical pattern: {evidence.get('historical_pattern')}")
         if str(evidence.get("frontier_gap", "")).strip():
             lines.append(f"- Frontier gap: {evidence.get('frontier_gap')}")
+    domain = memory.get("user_domain_knowledge", {})
+    if isinstance(domain, dict) and domain.get("paper_count"):
+        lines.append(
+            f"- User library: {domain.get('paper_count')} domain-background papers, "
+            f"{domain.get('full_text_hint_count', 0)} with full-text hints; {domain.get('policy', '')}"
+        )
     limitations = memory.get("recent_limitations_focus", [])
     if isinstance(limitations, list) and limitations:
         lines.append("- Recent limitations focus:")
@@ -208,6 +216,7 @@ def build_session_memory_status(memory: Dict[str, object]) -> Dict[str, object]:
     limitations = memory.get("recent_limitations_focus", [])
     risks = memory.get("unresolved_risks", [])
     experiments = memory.get("next_experiments", [])
+    domain = memory.get("user_domain_knowledge", {})
     try:
         turn_count = int(memory.get("turn_count", 0) or 0)
     except (TypeError, ValueError):
@@ -218,6 +227,8 @@ def build_session_memory_status(memory: Dict[str, object]) -> Dict[str, object]:
         "turn_count": turn_count,
         "stable_thesis": compact_text(memory.get("stable_thesis", ""), 260),
         "recent_limitations_count": len(limitations) if isinstance(limitations, list) else 0,
+        "user_library_paper_count": int(domain.get("paper_count", 0) or 0) if isinstance(domain, dict) else 0,
+        "user_library_full_text_hint_count": int(domain.get("full_text_hint_count", 0) or 0) if isinstance(domain, dict) else 0,
         "unresolved_risk": compact_text(risks[0], 220) if isinstance(risks, list) and risks else "",
         "next_experiment": compact_text(experiments[0], 220) if isinstance(experiments, list) and experiments else "",
         "cache_policy": "Full turn history is compressed into memory_summary and recent turns are kept for local continuity.",
@@ -274,6 +285,44 @@ def extract_review_focus(session_context: Dict[str, object]) -> List[Dict[str, s
                 }
             )
     return result[-3:]
+
+
+def summarize_user_domain_knowledge(session_context: Dict[str, object]) -> Dict[str, object]:
+    context = session_context.get("domain_knowledge_context")
+    if not isinstance(context, dict):
+        return {
+            "paper_count": 0,
+            "full_text_hint_count": 0,
+            "policy": "user_library_domain_knowledge_only",
+            "titles": [],
+        }
+    papers = context.get("papers", [])
+    if not isinstance(papers, list):
+        papers = []
+    titles: List[str] = []
+    hint_titles: List[str] = []
+    for paper in papers:
+        if not isinstance(paper, dict):
+            continue
+        title = compact_text(paper.get("title", ""), 120)
+        if title:
+            titles.append(title)
+        hints = paper.get("full_text_domain_hints", {})
+        if isinstance(hints, dict) and any(str(value).strip() for value in hints.values()):
+            hint_titles.append(title or compact_text(paper.get("paper_id", ""), 40))
+    return {
+        "paper_count": len([paper for paper in papers if isinstance(paper, dict)]),
+        "full_text_hint_count": len(hint_titles),
+        "policy": "user_library_domain_knowledge_only_never_scoring_standard",
+        "titles": compact_list(titles, limit=6, chars=120),
+        "full_text_hint_titles": compact_list(hint_titles, limit=6, chars=120),
+        "allowed_uses": compact_list(context.get("allowed_uses", []), limit=6, chars=80)
+        if isinstance(context.get("allowed_uses", []), list)
+        else [],
+        "forbidden_uses": compact_list(context.get("forbidden_uses", []), limit=6, chars=80)
+        if isinstance(context.get("forbidden_uses", []), list)
+        else [],
+    }
 
 
 def limitations_from_payload(payload: object) -> List[Dict[str, str]]:

@@ -133,6 +133,7 @@ def harvest_openalex(
         "select": ",".join(
             [
                 "id",
+                "ids",
                 "display_name",
                 "publication_year",
                 "publication_date",
@@ -582,9 +583,12 @@ def parse_neurips_oral_html(html: str, *, year: int, source_url: str = "") -> Li
             continue
         authors = str(item.get("authors", "")).strip()
         body = str(item.get("body", "")).strip()
-        abstract = f"Authors: {authors}".strip() if authors else ""
-        if body and body.lower() != title.lower() and body not in abstract:
-            abstract = f"{abstract}\n\n{body}".strip()
+        abstract_parts = []
+        if authors:
+            abstract_parts.append(f"Authors: {authors}")
+        if body and body.lower() != title.lower():
+            abstract_parts.append(body)
+        abstract = "\n\n".join(abstract_parts).strip()
         records.append(
             {
                 "title": title,
@@ -1110,7 +1114,13 @@ def cvf_award_sections(html: str) -> List[tuple[str, str]]:
 
 def cvf_award_items(section_html: str) -> List[dict]:
     items: List[dict] = []
-    card_matches = list(re.finditer(r'<div\b[^>]+class="[^"]*\bvirtual-card\b[^"]*"[^>]*>(.*?)</div>', section_html, flags=re.IGNORECASE | re.DOTALL))
+    card_matches = list(
+        re.finditer(
+            r'<div\b[^>]+class="[^"]*\b(?:virtual-card|event-card)\b[^"]*"[^>]*>',
+            section_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    )
     if card_matches:
         for index, card in enumerate(card_matches):
             block_start = card.start()
@@ -1150,8 +1160,12 @@ def cvf_item_from_html(item_html: str) -> dict:
     authors = ""
     authors = authors_from_common_html(item_html)
     type_match = re.search(r'<div[^>]+class="[^"]*type_display_name_virtual_card[^"]*"[^>]*>(.*?)</div>', item_html, flags=re.IGNORECASE | re.DOTALL)
+    if not type_match:
+        type_match = re.search(r'<span[^>]+class="[^"]*event-type-badge[^"]*"[^>]*>(.*?)</span>', item_html, flags=re.IGNORECASE | re.DOTALL)
     abstract = ""
     abstract_match = re.search(r"<summary>\s*Abstract\s*</summary>\s*<div[^>]*>(.*?)</div>", item_html, flags=re.IGNORECASE | re.DOTALL)
+    if not abstract_match:
+        abstract_match = re.search(r'<div[^>]+class="[^"]*event-abstract[^"]*"[^>]*>(.*?)</div>\s*</div>', item_html, flags=re.IGNORECASE | re.DOTALL)
     if abstract_match:
         abstract = clean_html_text(abstract_match.group(1))
     return {
@@ -1176,6 +1190,7 @@ def title_href_from_html(item_html: str) -> tuple[str, str]:
 def authors_from_common_html(item_html: str) -> str:
     for pattern in (
         r'<div[^>]+class="[^"]*author-str[^"]*"[^>]*>(.*?)</div>',
+        r'<div[^>]+class="[^"]*event-speakers[^"]*"[^>]*>(.*?)</div>',
         r'<div[^>]+class="[^"]*authors?[^"]*"[^>]*>(.*?)</div>',
         r"<i[^>]*>(.*?)</i>",
         r"<em[^>]*>(.*?)</em>",
@@ -1566,11 +1581,38 @@ def normalize_openalex_work(item: Dict[str, Any], preferred_source_ids: Iterable
         "venue": source.get("display_name", "").strip(),
         "year": int(item.get("publication_year") or 0),
         "publication_date": str(item.get("publication_date") or "").strip(),
-        "external_ref": item.get("id", "").strip(),
+        "external_ref": best_openalex_full_text_ref(item),
         "citation_count": int(item.get("cited_by_count") or 0),
         "influential_citation_count": 0,
         "award": "",
     }
+
+
+def best_openalex_full_text_ref(item: Dict[str, Any]) -> str:
+    candidates: List[str] = []
+    for location in [item.get("primary_location") or {}, *(item.get("locations") or [])]:
+        if not isinstance(location, dict):
+            continue
+        for key in ("pdf_url", "landing_page_url"):
+            value = str(location.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+    ids = item.get("ids") or {}
+    if isinstance(ids, dict):
+        for key in ("doi", "arxiv", "openalex"):
+            value = str(ids.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+    openalex_id = str(item.get("id") or "").strip()
+    if openalex_id:
+        candidates.append(openalex_id)
+    for value in candidates:
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+    for value in candidates:
+        if value:
+            return value
+    return ""
 
 
 def select_openalex_source(item: Dict[str, Any], preferred_source_ids: Iterable[str] = ()) -> Dict[str, Any]:
